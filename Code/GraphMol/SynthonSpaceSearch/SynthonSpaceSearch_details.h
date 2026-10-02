@@ -193,6 +193,23 @@ RDKIT_SYNTHONSPACESEARCH_EXPORT bool hasUnspecifiedStereo(ROMol &mol);
 RDKIT_SYNTHONSPACESEARCH_EXPORT void pruneShapes(ShapeSet &shapeSet,
                                                  double simThreshold);
 
+constexpr unsigned int MAX_SHAPE_STEREOISOMERS = 3;
+
+RDKIT_SYNTHONSPACESEARCH_EXPORT std::pair<std::vector<std::string>, std::string>
+prepareSynthonShapeRecord(
+  const std::vector<std::unique_ptr<SampleMolRec>> &samples,
+  const ShapeBuildParams &params);
+RDKIT_SYNTHONSPACESEARCH_EXPORT std::string getPreparedShapeSynthon(
+  const std::string &record, const ShapeBuildParams &params);
+RDKIT_SYNTHONSPACESEARCH_EXPORT void buildSynthonShapesFromRecord(
+  Synthon &synthon, const std::string &record, ShapeBuildParams &params);
+RDKIT_SYNTHONSPACESEARCH_EXPORT
+std::pair<std::string, std::unique_ptr<SynthonShapeInput>>
+buildSynthonShapeFromRecord(const std::string &record, ShapeBuildParams &params);
+RDKIT_SYNTHONSPACESEARCH_EXPORT std::pair<std::string, std::vector<std::string>>
+getSynthonShapePreparationInfo(const std::string &record,
+                               const ShapeBuildParams &params);
+
 // Generate conformers for the molecule passed in, including enumerating
 // stereoisomers if requested.
 RDKIT_SYNTHONSPACESEARCH_EXPORT std::vector<std::unique_ptr<RWMol>>

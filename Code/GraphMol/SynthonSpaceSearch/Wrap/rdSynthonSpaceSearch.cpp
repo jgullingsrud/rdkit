@@ -16,6 +16,7 @@
 #include <GraphMol/RascalMCES/RascalOptions.h>
 #include <GraphMol/GaussianShape/ShapeOverlayOptions.h>
 #include <GraphMol/SynthonSpaceSearch/SynthonSpace.h>
+#include <GraphMol/SynthonSpaceSearch/SynthonSpaceSearch_details.h>
 
 namespace python = boost::python;
 
@@ -439,10 +440,35 @@ void buildShapes_helper(SynthonSpaceSearch::SynthonSpace &spc,
   }
 }
 
+python::list getSynthonShapeSmiles_helper(
+    const SynthonSpaceSearch::SynthonSpace &spc,
+    const python::object &py_params) {
+  SynthonSpaceSearch::ShapeBuildParams params;
+  if (!py_params.is_none()) {
+    params = python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params);
+  }
+  bool cancelled = false;
+  std::vector<std::string> smiles;
+  {
+    NOGIL gil;
+    smiles = spc.getSynthonShapeSmiles(cancelled, params);
+  }
+  if (cancelled) {
+    PyErr_SetString(PyExc_KeyboardInterrupt, "Shape discovery cancelled");
+    python::throw_error_already_set();
+  }
+  python::list result;
+  for (const auto &smile : smiles) {
+    result.append(smile);
+  }
+  return result;
+}
+
 class pyUserConfGenFunctor {
  public:
   pyUserConfGenFunctor(python::object obj) : dp_obj(std::move(obj)) {}
   ~pyUserConfGenFunctor() = default;
+  const python::object &getCallable() const { return dp_obj; }
   std::unique_ptr<RWMol> operator()(const std::string &smiles,
                                     unsigned int numConformers) {
     // grab the GIL
@@ -455,6 +481,185 @@ class pyUserConfGenFunctor {
  private:
   python::object dp_obj;
 };
+
+void prepareSynthonShapes_helper(const SynthonSpaceSearch::SynthonSpace &space,
+                                 const python::object &py_params,
+                                 const python::object &callback) {
+  auto params =
+      python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params)();
+  bool cancelled = false;
+  {
+    NOGIL gil;
+    space.prepareSynthonShapes(
+        cancelled, params,
+        [&](const std::vector<std::string> &smiles, const std::string &record) {
+          PyGILStateHolder holder;
+          python::list requests;
+          for (const auto &smile : smiles) {
+            requests.append(smile);
+          }
+          python::object payload(python::handle<>(
+              PyBytes_FromStringAndSize(record.data(), record.size())));
+          callback(requests, payload);
+        });
+  }
+  if (cancelled) {
+    PyErr_SetString(PyExc_KeyboardInterrupt, "Shape preparation cancelled");
+    python::throw_error_already_set();
+  }
+}
+
+void buildPreparedShapes_helper(SynthonSpaceSearch::SynthonSpace &space,
+                                const python::object &py_params,
+                                const python::object &supplier,
+                                const python::object &binarySupplier) {
+  auto params =
+      python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params)();
+  PyObject *errorType = nullptr, *errorValue = nullptr, *errorTrace = nullptr;
+  python::object conformerCallback;
+  if (auto functor =
+          params.userConformerGenerator.target<pyUserConfGenFunctor>()) {
+    conformerCallback = functor->getCallable();
+  }
+  if (!conformerCallback.is_none() || !binarySupplier.is_none()) {
+    params.userConformerGenerator = [&](const std::string &smiles,
+                                        unsigned int count) {
+      std::string binary;
+      {
+        PyGILStateHolder holder;
+        try {
+          if (binarySupplier.is_none()) {
+            python::object result = conformerCallback(smiles, count);
+            ROMol *mol = python::extract<ROMol *>(result);
+            return std::make_unique<RWMol>(*mol);
+          }
+          python::object result = binarySupplier(smiles, count);
+          if (!result.is_none()) {
+            char *data;
+            Py_ssize_t size;
+            if (PyBytes_AsStringAndSize(result.ptr(), &data, &size) < 0) {
+              python::throw_error_already_set();
+            }
+            binary.assign(data, size);
+          }
+        } catch (python::error_already_set &) {
+          if (!errorType) {
+            PyErr_Fetch(&errorType, &errorValue, &errorTrace);
+          } else {
+            PyErr_Clear();
+          }
+          throw std::runtime_error("Prepared conformer callback failed");
+        }
+      }
+      return binary.empty() ? std::unique_ptr<RWMol>()
+                            : std::make_unique<RWMol>(binary);
+    };
+  }
+  bool cancelled = false;
+  try {
+    NOGIL gil;
+    space.buildSynthonShapesFromPreparation(cancelled, params, [&]() {
+      PyGILStateHolder holder;
+      python::object result = supplier();
+      if (result.is_none()) {
+        return std::string();
+      }
+      char *data;
+      Py_ssize_t size;
+      if (PyBytes_AsStringAndSize(result.ptr(), &data, &size) < 0) {
+        python::throw_error_already_set();
+      }
+      return std::string(data, size);
+    });
+  } catch (...) {
+    if (errorType) {
+      PyErr_Restore(errorType, errorValue, errorTrace);
+      python::throw_error_already_set();
+    }
+    throw;
+  }
+  if (cancelled) {
+    PyErr_SetString(PyExc_KeyboardInterrupt,
+                    "Prepared shape assembly cancelled");
+    python::throw_error_already_set();
+  }
+}
+
+std::string shapePayloadBytes(const python::object &value) {
+  if (value.is_none()) {
+    return {};
+  }
+  char *data;
+  Py_ssize_t size;
+  if (PyBytes_AsStringAndSize(value.ptr(), &data, &size) < 0) {
+    python::throw_error_already_set();
+  }
+  return std::string(data, size);
+}
+
+python::tuple preparationInfo_helper(const python::object &py_params,
+                                     const python::object &record) {
+  auto params =
+      python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params)();
+  const auto payload = shapePayloadBytes(record);
+  std::pair<std::string, std::vector<std::string>> info;
+  {
+    NOGIL gil;
+    info = SynthonSpaceSearch::details::getSynthonShapePreparationInfo(payload,
+                                                                       params);
+  }
+  python::list requests;
+  for (const auto &smiles : info.second) {
+    requests.append(smiles);
+  }
+  return python::make_tuple(info.first, requests);
+}
+
+python::tuple buildPreparedSynthon_helper(const python::object &py_params,
+                                          const python::object &record,
+                                          const python::object &supplier) {
+  auto params =
+      python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params)();
+  const auto payload = shapePayloadBytes(record);
+  params.userConformerGenerator = [&](const std::string &smiles,
+                                      unsigned int count) {
+    std::string binary;
+    {
+      PyGILStateHolder holder;
+      binary = shapePayloadBytes(supplier(smiles, count));
+    }
+    return binary.empty() ? std::unique_ptr<RWMol>()
+                          : std::make_unique<RWMol>(binary);
+  };
+  bool cancelled = false;
+  std::pair<std::string, std::string> result;
+  {
+    NOGIL gil;
+    result = SynthonSpaceSearch::buildSynthonShapeFromPreparation(
+        payload, cancelled, params);
+  }
+  if (cancelled) {
+    PyErr_SetString(PyExc_KeyboardInterrupt,
+                    "Synthon shape construction cancelled");
+    python::throw_error_already_set();
+  }
+  python::object shape(python::handle<>(
+      PyBytes_FromStringAndSize(result.second.data(), result.second.size())));
+  return python::make_tuple(result.first, shape);
+}
+
+void setSynthonShapes_helper(SynthonSpaceSearch::SynthonSpace &space,
+                             const python::object &entries,
+                             unsigned int numConformers) {
+  std::vector<std::pair<std::string, std::string>> shapes;
+  for (Py_ssize_t index = 0; index < python::len(entries); ++index) {
+    python::object entry = entries[index];
+    shapes.emplace_back(python::extract<std::string>(entry[0])(),
+                        shapePayloadBytes(entry[1]));
+  }
+  NOGIL gil;
+  space.setSynthonShapes(shapes, numConformers);
+}
 
 void setUserConfGen_helper(SynthonSpaceSearch::ShapeBuildParams &ps,
                            python::object func) {
@@ -895,12 +1100,48 @@ BOOST_PYTHON_MODULE(rdSynthonSpaceSearch) {
           " explicitly.  If progressBarWidth is > 0, a progress bar of that width"
           " plus about 35 characters is displayed.")
       .def(
+          "SetSynthonShapes", &helpers::setSynthonShapes_helper,
+          (python::arg("self"), python::arg("shapes"), python::arg("numConformers")),
+          "Attach (synthon SMILES key, serialized shape bytes) entries without"
+          " shape construction. Empty payloads represent missing shapes.")
+        .def(
+          "PrepareSynthonShapes", &helpers::prepareSynthonShapes_helper,
+          (python::arg("self"), python::arg("params"), python::arg("callback")),
+          "Call callback(smiles, record) with reusable, embedding-free preparation"
+          " for each eligible synthon. The opaque bytes record preserves annotations"
+          " and context preference and requires the same source database.")
+        .def(
+          "BuildSynthonShapesFromPreparation", &helpers::buildPreparedShapes_helper,
+          (python::arg("self"), python::arg("params"), python::arg("supplier"),
+           python::arg("conformerSupplier") = python::object()),
+          "Build shapes using preparation records and params' conformer generator."
+          " supplier() returns record bytes, or None at EOF. No sample construction"
+          " or stereo enumeration is repeated. Optional conformerSupplier(smiles,"
+          " count) returns molecule-pickle bytes or None, replacing the generator.")
+        .def(
+          "GetSynthonShapeSmiles", &helpers::getSynthonShapeSmiles_helper,
+          (python::arg("self"), python::arg("py_params") = python::object()),
+          "Return sorted unique SMILES for embedding-free shape preparation,"
+          " including stereo variants and unenumerated fallback molecules."
+          " Uses native threads without calling a conformer generator or"
+          " modifying the space. tryEmbedding is ignored. A fixed stereo seed"
+          " makes results independent of thread count.")
+        .def(
           "BuildSynthonShapes", &helpers::buildShapes_helper,
           (python::arg("self"), python::arg("py_params") = python::object()),
           "Build shapes for the synthons.  The conformations are generated, pruned"
           " with the given threshold, which is passed directly to EmbedMultipleConfs.");
 
-  docString =
+    python::def("GetSynthonShapePreparationInfo", &helpers::preparationInfo_helper,
+          (python::arg("params"), python::arg("record")),
+          "Return the target synthon key and unique conformer-request SMILES.");
+    python::def("BuildSynthonShapeFromPreparation", &helpers::buildPreparedSynthon_helper,
+          (python::arg("params"), python::arg("record"),
+           python::arg("conformerSupplier")),
+          "Build one synthon without a database. The supplier returns molecule"
+          " pickle bytes or None. Returns (synthon key, serialized shape bytes).");
+
+    docString =
       "Convert the text file into the binary DB file in our format."
       "  Assumes that all synthons from a reaction are contiguous in the input file."
       "  This uses a lot less memory than using ReadTextFile() followed by"

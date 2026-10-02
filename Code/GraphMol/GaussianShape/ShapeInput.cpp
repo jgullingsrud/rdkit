@@ -758,9 +758,8 @@ $([N;H0&+0]([C;!$(C(=O))])([C;!$(C(=O))])[C;!$(C(=O))])]"},  // Basic
     {"[$([C,S](=[O,S,P])-[O;H1,-1])]"}                       // Acidic
 };
 std::vector<std::vector<const ROMol *>> *getPh4Patterns() {
-  static std::unique_ptr<std::vector<std::vector<const ROMol *>>> patterns;
-  if (!patterns) {
-    patterns.reset(new std::vector<std::vector<const ROMol *>>());
+  static auto patterns = [] {
+    auto result = std::make_unique<std::vector<std::vector<const ROMol *>>>();
     for (const auto &smartsV : smartsPatterns) {
       std::vector<const ROMol *> v;
       for (const auto &smarts : smartsV) {
@@ -768,9 +767,10 @@ std::vector<std::vector<const ROMol *>> *getPh4Patterns() {
         CHECK_INVARIANT(matcher, "bad smarts");
         v.push_back(matcher);
       }
-      patterns->push_back(std::move(v));
+      result->push_back(std::move(v));
     }
-  }
+    return result;
+  }();
 
   return patterns.get();
 }

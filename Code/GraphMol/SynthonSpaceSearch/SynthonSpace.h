@@ -468,6 +468,46 @@ class RDKIT_SYNTHONSPACESEARCH_EXPORT SynthonSpace {
    */
   void buildSynthonShapes(bool &cancelled, ShapeBuildParams &shapeBuildParams);
 
+  using ShapePreparationCallback = std::function<void(
+      const std::vector<std::string> &, const std::string &)>;
+  using ShapePreparationSupplier = std::function<std::string()>;
+
+  /*! Emit one opaque preparation record per eligible synthon, plus its requests.
+   * Records preserve context preference and annotated stereo/fallback molecules.
+   * No embedding is done. The callback runs on the calling thread. Records must
+   * be used with the same input database and compatible preparation settings.
+   */
+  void prepareSynthonShapes(bool &cancelled, const ShapeBuildParams &params,
+                            const ShapePreparationCallback &callback) const;
+
+  /*! Build shapes from preparation records and a user conformer generator.
+   * The supplier runs on the calling thread and returns an empty string at EOF.
+   * Each synthon may occur once. Missing records leave those synthons unchanged.
+   */
+  void buildSynthonShapesFromPreparation(
+      bool &cancelled, ShapeBuildParams &params,
+      const ShapePreparationSupplier &supplier);
+
+  /*! Attach externally computed shapes without repeating shape construction.
+   * Entries use the original synthon SMILES key and a serialized SynthonShapeInput.
+   * Empty payloads represent missing shapes. Unknown, repeated, or already-shaped
+   * synthons are rejected within a batch. numConformers sets database metadata.
+   */
+  void setSynthonShapes(
+      const std::vector<std::pair<std::string, std::string>> &shapes,
+      unsigned int numConformers);
+
+    /*! Return sorted unique SMILES for embedding-free shape preparation.
+     * Includes enumerated stereoisomers and the unenumerated fallback for every
+     * eligible synthon/reaction context. Existing shapes and maxSynthonAtoms are
+     * respected. No conformers are generated and the space is not modified.
+     * stereoEnumOpts.tryEmbedding is ignored. numThreads controls native workers.
+     * A fixed stereoEnumOpts.randomSeed makes results independent of thread count.
+     * On cancellation, returns an empty vector and sets cancelled.
+     */
+    std::vector<std::string> getSynthonShapeSmiles(
+            bool &cancelled, const ShapeBuildParams &shapeBuildParams) const;
+
   void reportSynthonUsage(std::ostream &os) const;
   std::uint64_t getNumSynthonsWithShapes() const;
 
@@ -588,6 +628,15 @@ RDKIT_SYNTHONSPACESEARCH_EXPORT void convertTextToDBFile(
     const std::string &inFilename, const std::string &outFilename,
     bool &cancelled, const FingerprintGenerator<std::uint64_t> *fpGen = nullptr,
     ShapeBuildParams *shapeParams = nullptr);
+
+/*! Build one synthon's shapes from a preparation record without a SynthonSpace.
+ * Returns the synthon key and serialized shapes, or an empty shape payload when
+ * no context succeeds. Uses params.userConformerGenerator and preserves context
+ * and stereo fallback order. The caller must check cancelled before using output.
+ */
+RDKIT_SYNTHONSPACESEARCH_EXPORT std::pair<std::string, std::string>
+buildSynthonShapeFromPreparation(const std::string &record, bool &cancelled,
+                                 ShapeBuildParams &params);
 
 /*!
  * Format an integer with spaces every 3 digits for ease

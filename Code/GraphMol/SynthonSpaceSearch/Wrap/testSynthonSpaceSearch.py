@@ -37,13 +37,14 @@ import tempfile
 import time
 import unittest
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from pathlib import Path
 
 from rdkit import Chem
 from rdkit.Chem import (rdSynthonSpaceSearch, rdFingerprintGenerator,
                         rdRascalMCES, rdGeneralizedSubstruct, rdMolDescriptors,
-                        rdDistGeom, rdGaussianShape)
+                        rdDistGeom, rdGaussianShape, rdEnumerateStereoisomers)
 
 def createShapeDatabaseForTest(spaceFile, restartFile):
   space = rdSynthonSpaceSearch.SynthonSpace()
@@ -65,6 +66,125 @@ class TestCase(unittest.TestCase):
     # For profiling/debugging.
     t = time.time() - self.startTime
     # print(f"Test {self.id()} took {t:.3f}s")
+
+  def testShapeSmiles(self):
+    space = rdSynthonSpaceSearch.SynthonSpace()
+    self.assertEqual(space.GetSynthonShapeSmiles(), [])
+    space.ReadTextFile(str(self.sssDir / "amide_space.txt"))
+    params = rdSynthonSpaceSearch.ShapeBuildParams()
+    expected = set()
+
+    def record(smiles, numConfs):
+      expected.add(smiles)
+      return Chem.MolFromSmiles(smiles)
+
+    options = rdEnumerateStereoisomers.StereoEnumerationOptions()
+    options.randomSeed = params.stereoEnumOpts.randomSeed
+    options.tryEmbedding = False
+    params.stereoEnumOpts = options
+    params.interimWrites = 0
+    params.setUserConformerGenerator(record)
+    space.BuildSynthonShapes(params)
+    self.assertTrue(expected)
+    for threads in (1, 2):
+      params.numThreads = threads
+      self.assertEqual(space.GetSynthonShapeSmiles(params), sorted(expected))
+    self.assertEqual(space.GetNumSynthonsWithShapes(), 0)
+    shaped = rdSynthonSpaceSearch.SynthonSpace()
+    shaped.ReadDBFile(str(self.sssDir / "amide_space_shapes.spc"))
+    self.assertEqual(shaped.GetSynthonShapeSmiles(params), [])
+
+  def testPreparedShapeAssembly(self):
+    with tempfile.TemporaryDirectory() as directory:
+      original = Path(directory) / "input.spc"
+      source = rdSynthonSpaceSearch.SynthonSpace()
+      source.ReadTextFile(str(self.sssDir / "amide_space.txt"))
+      source.WriteDBFile(str(original))
+
+      def reload():
+        space = rdSynthonSpaceSearch.SynthonSpace()
+        space.ReadDBFile(str(original), 2)
+        return space
+
+      source = reload()
+      params = rdSynthonSpaceSearch.ShapeBuildParams()
+      params.numConfs = 2
+      params.numThreads = 2
+      params.interimWrites = 0
+      options = rdEnumerateStereoisomers.StereoEnumerationOptions()
+      options.tryEmbedding = False
+      options.randomSeed = 3500
+      params.stereoEnumOpts = options
+      records = []
+      requests = set()
+
+      def record(smiles, payload):
+        self.assertIsInstance(payload, bytes)
+        records.append(payload)
+        requests.update(smiles)
+
+      source.PrepareSynthonShapes(params, record)
+      self.assertEqual(source.GetNumSynthonsWithShapes(), 0)
+      self.assertEqual(sorted(requests), source.GetSynthonShapeSmiles(params))
+      self.assertEqual(len(records), source.GetNumSynthons())
+      cache = {}
+      for smiles in sorted(requests):
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        rdDistGeom.EmbedMultipleConfs(mol, 2, randomSeed=3500)
+        cache[smiles] = Chem.RemoveHs(mol)
+
+      params.setUserConformerGenerator(lambda smiles, count: cache[smiles])
+      legacy = reload()
+      legacy.BuildSynthonShapes(params)
+      legacy.WriteDBFile(str(Path(directory) / "legacy.spc"))
+      prepared = reload()
+      iterator = iter(records)
+      prepared.BuildSynthonShapesFromPreparation(params, lambda: next(iterator, None))
+      prepared.WriteDBFile(str(Path(directory) / "prepared.spc"))
+      self.assertEqual((Path(directory) / "legacy.spc").read_bytes(),
+                       (Path(directory) / "prepared.spc").read_bytes())
+
+      def build(record):
+        target, dependencies = rdSynthonSpaceSearch.GetSynthonShapePreparationInfo(params, record)
+        self.assertTrue(set(dependencies).issubset(requests))
+        result = rdSynthonSpaceSearch.BuildSynthonShapeFromPreparation(
+            params, record,
+            lambda smiles, count: cache[smiles].ToBinary(Chem.PropertyPickleOptions.CoordsAsDouble))
+        self.assertEqual(result[0], target)
+        return result
+
+      with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(build, records))
+      distributed = reload()
+      distributed.SetSynthonShapes(list(reversed(results)), params.numConfs)
+      distributed.WriteDBFile(str(Path(directory) / "distributed.spc"))
+      self.assertEqual((Path(directory) / "legacy.spc").read_bytes(),
+                       (Path(directory) / "distributed.spc").read_bytes())
+      for invalid in ([results[0], results[0]], [("unknown", b"")],
+                      [(results[0][0], b"invalid")]):
+        with self.assertRaises((ValueError, RuntimeError)):
+          reload().SetSynthonShapes(invalid, params.numConfs)
+      with self.assertRaises((ValueError, RuntimeError)):
+        distributed.SetSynthonShapes(results, params.numConfs)
+
+      for invalid in ([records[0], records[0]], [records[0][:-20]], [b"invalid"]):
+        iterator = iter(invalid)
+        with self.assertRaises((ValueError, RuntimeError)):
+          reload().BuildSynthonShapesFromPreparation(params, lambda: next(iterator, None))
+
+      def fail(*args):
+        raise LookupError("test callback exception")
+
+      with self.assertRaisesRegex(LookupError, "test callback exception"):
+        rdSynthonSpaceSearch.BuildSynthonShapeFromPreparation(params, records[0], fail)
+      with self.assertRaisesRegex(LookupError, "test callback exception"):
+        source.PrepareSynthonShapes(params, fail)
+      with self.assertRaisesRegex(LookupError, "test callback exception"):
+        reload().BuildSynthonShapesFromPreparation(params, fail)
+      params.setUserConformerGenerator(fail)
+      iterator = iter(records)
+      with self.assertRaisesRegex(LookupError, "test callback exception"):
+        reload().BuildSynthonShapesFromPreparation(params, lambda: next(iterator, None))
 
   def testSubstructSearch(self):
     fName = self.sssDir / "idorsia_toy_space_a.spc"

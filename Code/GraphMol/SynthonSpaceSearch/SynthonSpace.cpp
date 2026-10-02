@@ -9,8 +9,10 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <random>
 #include <regex>
 #include <set>
@@ -18,8 +20,10 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 #include <boost/dynamic_bitset.hpp>
+#include <boost/functional/hash.hpp>
 
 #include <GraphMol/MolOps.h>
 #include <GraphMol/QueryAtom.h>
@@ -964,6 +968,247 @@ void SynthonSpace::buildSynthonShapes(bool &cancelled,
       cancelled = true;
     }
   }
+}
+
+void SynthonSpace::prepareSynthonShapes(
+    bool &cancelled, const ShapeBuildParams &params,
+    const ShapePreparationCallback &callback) const {
+  PRECONDITION(callback, "Missing shape preparation callback");
+  cancelled = false;
+  std::vector<std::vector<std::unique_ptr<SampleMolRec>>> samples;
+  buildSynthonSampleMolecules(params.maxSynthonAtoms, samples);
+  const size_t numThreads = getNumThreadsToUse(params.numThreads);
+  const size_t batchSize = 64 * numThreads;
+  for (size_t begin = 0; begin < samples.size(); begin += batchSize) {
+    if (ControlCHandler::getGotSignal()) {
+      cancelled = true;
+      return;
+    }
+    const auto count = std::min(batchSize, samples.size() - begin);
+    std::vector<std::pair<std::vector<std::string>, std::string>> results(
+        count);
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> workers;
+    for (size_t worker = 0; worker < std::min(numThreads, count); ++worker) {
+      workers.push_back(std::async(std::launch::async, [&]() {
+        while (!ControlCHandler::getGotSignal()) {
+          const auto index = next.fetch_add(1);
+          if (index >= count) {
+            break;
+          }
+          results[index] = details::prepareSynthonShapeRecord(
+              samples[begin + index], params);
+        }
+      }));
+    }
+    for (auto &worker : workers) {
+      worker.get();
+    }
+    if (ControlCHandler::getGotSignal()) {
+      cancelled = true;
+      return;
+    }
+    for (auto &result : results) {
+      callback(result.first, result.second);
+    }
+  }
+}
+
+void SynthonSpace::buildSynthonShapesFromPreparation(
+    bool &cancelled, ShapeBuildParams &params,
+    const ShapePreparationSupplier &supplier) {
+  PRECONDITION(supplier, "Missing shape preparation supplier");
+  if (!params.userConformerGenerator) {
+    throw std::invalid_argument(
+        "Prepared assembly requires a conformer supplier");
+  }
+  cancelled = false;
+  d_numConformers = params.numConfs;
+  const size_t numThreads = getNumThreadsToUse(params.numThreads);
+  const size_t batchSize = 64 * numThreads;
+  std::unordered_set<Synthon *> seen;
+  while (!ControlCHandler::getGotSignal()) {
+    std::vector<std::pair<Synthon *, std::string>> records;
+    for (size_t index = 0; index < batchSize; ++index) {
+      auto record = supplier();
+      if (record.empty()) {
+        break;
+      }
+      const auto smiles = details::getPreparedShapeSynthon(record, params);
+      auto synthon = getSynthonFromPool(smiles);
+      if (!synthon || !seen.insert(synthon).second) {
+        throw std::invalid_argument("Unknown or duplicate prepared synthon");
+      }
+      records.emplace_back(synthon, std::move(record));
+    }
+    if (records.empty()) {
+      break;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> workers;
+    for (size_t worker = 0; worker < std::min(numThreads, records.size());
+         ++worker) {
+      workers.push_back(std::async(std::launch::async, [&]() {
+        while (!ControlCHandler::getGotSignal()) {
+          const auto index = next.fetch_add(1);
+          if (index >= records.size()) {
+            break;
+          }
+          details::buildSynthonShapesFromRecord(*records[index].first,
+                                                records[index].second, params);
+        }
+      }));
+    }
+    for (auto &worker : workers) {
+      worker.get();
+    }
+  }
+  cancelled = ControlCHandler::getGotSignal();
+}
+
+std::pair<std::string, std::string> buildSynthonShapeFromPreparation(
+    const std::string &record, bool &cancelled, ShapeBuildParams &params) {
+  auto result = details::buildSynthonShapeFromRecord(record, params);
+  cancelled = ControlCHandler::getGotSignal();
+  return {std::move(result.first), !cancelled && result.second
+                                       ? result.second->toString()
+                                       : std::string()};
+}
+
+void SynthonSpace::setSynthonShapes(
+    const std::vector<std::pair<std::string, std::string>> &shapes,
+    unsigned int numConformers) {
+  if (!numConformers || (d_numConformers && d_numConformers != numConformers &&
+                         getNumSynthonsWithShapes())) {
+    throw std::invalid_argument("Incompatible shape conformer count");
+  }
+  std::unordered_set<Synthon *> seen;
+  std::vector<std::pair<Synthon *, std::unique_ptr<SynthonShapeInput>>> parsed;
+  for (const auto &[smiles, payload] : shapes) {
+    auto synthon = getSynthonFromPool(smiles);
+    if (!synthon || !seen.insert(synthon).second || synthon->getShapes()) {
+      throw std::invalid_argument(
+          "Unknown, duplicate, or already-shaped synthon");
+    }
+    parsed.emplace_back(synthon,
+                        payload.empty()
+                            ? nullptr
+                            : std::make_unique<SynthonShapeInput>(payload));
+  }
+  for (auto &entry : parsed) {
+    if (entry.second) {
+      entry.first->setShapes(std::move(entry.second));
+    }
+  }
+  d_numConformers = numConformers;
+}
+
+std::vector<std::string> SynthonSpace::getSynthonShapeSmiles(
+    bool &cancelled, const ShapeBuildParams &shapeBuildParams) const {
+  cancelled = false;
+  std::vector<std::unique_ptr<SampleMolRec>> samples;
+  {
+    using SampleKey = std::pair<size_t, std::vector<const Synthon *>>;
+    std::unordered_set<SampleKey, boost::hash<SampleKey>> seen;
+    for (const auto &[reactionId, reaction] : d_reactions) {
+      const auto &synthons = reaction->getSynthons();
+      for (const auto &role : synthons) {
+        for (const auto &[synthonId, synthon] : role) {
+          if (ControlCHandler::getGotSignal()) {
+            cancelled = true;
+            return {};
+          }
+          if (synthon->getShapes() ||
+              (shapeBuildParams.maxSynthonAtoms &&
+               synthon->getNumHeavyAtoms() > shapeBuildParams.maxSynthonAtoms)) {
+            continue;
+          }
+          auto sample = reaction->makeSampleMolecule(synthon);
+          if (!sample->d_numAtoms) {
+            continue;
+          }
+          if (shapeBuildParams.stereoEnumOpts.randomSeed >= 0) {
+            SampleKey key{sample->d_synthonSetNum, {}};
+            key.second.reserve(synthons.size());
+            for (size_t roleNum = 0; roleNum < synthons.size(); ++roleNum) {
+              key.second.push_back(
+                  synthons[roleNum][sample->d_synthonNums[roleNum]].second);
+            }
+            if (!seen.insert(std::move(key)).second) {
+              continue;
+            }
+          }
+          samples.push_back(std::move(sample));
+        }
+      }
+    }
+  }
+  if (samples.empty()) {
+    return {};
+  }
+  const auto numThreads = std::min<size_t>(
+      getNumThreadsToUse(shapeBuildParams.numThreads), samples.size());
+  std::vector<std::unordered_set<std::string>> results(numThreads);
+  std::atomic<size_t> nextSample{0};
+  std::atomic<bool> failed{false};
+  std::vector<std::future<void>> workers;
+  for (size_t worker = 0; worker < numThreads; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      try {
+        auto options = shapeBuildParams.stereoEnumOpts;
+        options.tryEmbedding = false;
+        while (!failed && !ControlCHandler::getGotSignal()) {
+          const auto index = nextSample.fetch_add(1);
+          if (index >= samples.size()) {
+            break;
+          }
+          const auto &sample = samples[index];
+          auto product = sample->d_synthonSet->buildMolecule(sample->d_synthonNums);
+          if (!product) {
+            continue;
+          }
+          auto trimmed = details::trimSampleMol(*product, sample->d_synthonSetNum);
+          EnumerateStereoisomers::StereoisomerEnumerator enumerator(*trimmed,
+                                                                   options);
+          for (unsigned int isomerNum = 0;
+            isomerNum < details::MAX_SHAPE_STEREOISOMERS; ++isomerNum) {
+            auto isomer = enumerator.next();
+            if (!isomer) {
+              break;
+            }
+            results[worker].insert(MolToSmiles(*isomer));
+          }
+          results[worker].insert(MolToSmiles(*trimmed));
+        }
+      } catch (...) {
+        failed = true;
+        throw;
+      }
+    }));
+  }
+  std::exception_ptr error;
+  for (auto &worker : workers) {
+    try {
+      worker.get();
+    } catch (...) {
+      if (!error) {
+        error = std::current_exception();
+      }
+    }
+  }
+  if (error) {
+    std::rethrow_exception(error);
+  }
+  if (ControlCHandler::getGotSignal()) {
+    cancelled = true;
+    return {};
+  }
+  for (size_t worker = 1; worker < numThreads; ++worker) {
+    results.front().merge(results[worker]);
+  }
+  std::vector<std::string> smiles(results.front().begin(), results.front().end());
+  std::ranges::sort(smiles);
+  return smiles;
 }
 
 std::uint64_t SynthonSpace::getNumSynthonsWithShapes() const {

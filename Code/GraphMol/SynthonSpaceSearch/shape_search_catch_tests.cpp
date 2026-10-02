@@ -367,6 +367,137 @@ N#CCc(cncc1)c1[2*]	689988332-107515102	2	urea-3)");
   }
 }
 
+TEST_CASE("User conformer generator failures") {
+  auto mol = "CCO"_smiles;
+  REQUIRE(mol);
+  auto failure = GENERATE(0, 1, 2, 3);
+  auto enumerateStereo = GENERATE(false, true);
+  unsigned int calls = 0;
+  UserConfGenerator generator = [&](const std::string &smiles,
+                                    unsigned int numConformers) {
+    ++calls;
+    CHECK(smiles == "CCO");
+    CHECK(numConformers == 5);
+    if (failure == 0) {
+      return std::unique_ptr<RWMol>();
+    }
+    if (failure == 1) {
+      return std::make_unique<RWMol>();
+    }
+    auto result = v2::SmilesParse::MolFromSmiles(failure == 2 ? smiles : "C");
+    if (failure == 3) {
+      result->addConformer(new Conformer(result->getNumAtoms()));
+    }
+    return result;
+  };
+  EnumerateStereoisomers::StereoEnumerationOptions options;
+  options.tryEmbedding = false;
+  auto params = DGeomHelpers::ETKDGv3;
+  auto results = details::generateIsomerConformers(
+      *mol, 5, enumerateStereo, options, params, generator, 3);
+  CHECK(calls == 1);
+  CHECK(results.empty());
+}
+
+TEST_CASE("User conformer generator preserves synthon properties") {
+  auto mol = "[13CH3]CO"_smiles;
+  REQUIRE(mol);
+  mol->setProp(common_properties::_Name, std::string("sample"));
+  for (auto atom : mol->atoms()) {
+    atom->setProp("molNum", 2u);
+    atom->setProp("idx", atom->getIdx());
+    atom->setProp("HoldsJoin", std::string("1"));
+  }
+  for (auto bond : mol->bonds()) {
+    bond->setProp("molNum", 2u);
+    bond->setProp("idx", bond->getIdx());
+    bond->setProp("HoldsJoin", std::string("1"));
+  }
+  UserConfGenerator generator = [](const std::string &, unsigned int) {
+    auto result = v2::SmilesParse::MolFromSmiles("OC[13CH3]");
+    result->addConformer(new Conformer(result->getNumAtoms()));
+    return result;
+  };
+  EnumerateStereoisomers::StereoEnumerationOptions options;
+  options.tryEmbedding = false;
+  auto params = DGeomHelpers::ETKDGv3;
+  auto results = details::generateIsomerConformers(
+      *mol, 1, false, options, params, generator, 3);
+  REQUIRE(results.size() == 1);
+  const auto &result = *results.front();
+  CHECK(result.getNumConformers() == 1);
+  CHECK(result.getProp<std::string>(common_properties::_Name) == "sample");
+  for (auto atom : result.atoms()) {
+    CHECK(atom->getProp<unsigned int>("molNum") == 2);
+    CHECK(atom->getProp<unsigned int>("idx") == 2 - atom->getIdx());
+    CHECK(atom->getProp<std::string>("HoldsJoin") == "1");
+  }
+  for (auto bond : result.bonds()) {
+    CHECK(bond->getProp<unsigned int>("molNum") == 2);
+    CHECK(bond->getProp<unsigned int>("idx") == 1 - bond->getIdx());
+    CHECK(bond->getProp<std::string>("HoldsJoin") == "1");
+  }
+}
+
+TEST_CASE("Shape SMILES discovery matches conformer callbacks") {
+  const auto numThreads = GENERATE(1, 2);
+  const auto maxAtoms = GENERATE(0u, 1u, 50u);
+  std::istringstream input(R"(SMILES	synton_id	synton#	reaction_id
+C[1*]	methyl	0	first
+C[1*]	alias	0	first
+N[1*]	amine	0	first
+CC(F)[1*]	unspecified	0	first
+C[C@H](F)[1*]	specified	0	first
+C#CCO[C@@H]1CC[C@@H](N[1*])CC1	ring	0	first
+N[1*]	partner	1	first
+C[1*]	methyl	0	second
+CC(F)[1*]	unspecified	0	second
+N[1*]	partner	1	second
+)");
+  SynthonSpace space;
+  bool cancelled = false;
+  space.readStream(input, cancelled);
+  ShapeBuildParams params;
+  params.numThreads = numThreads;
+  params.maxSynthonAtoms = maxAtoms;
+  params.userConformerGenerator = [](const std::string &, unsigned int)
+      -> std::unique_ptr<RWMol> {
+    throw std::runtime_error("Discovery must not call the conformer generator");
+  };
+  const auto smiles = space.getSynthonShapeSmiles(cancelled, params);
+  CHECK_FALSE(cancelled);
+  CHECK(space.getNumSynthonsWithShapes() == 0);
+  CHECK(space.getSynthonShapeSmiles(cancelled, params) == smiles);
+  params.numThreads = 1;
+  params.stereoEnumOpts.tryEmbedding = false;
+  params.interimWrites = 0;
+  std::set<std::string> expected;
+  params.userConformerGenerator = [&](const std::string &smile, unsigned int) {
+    expected.insert(smile);
+    return v2::SmilesParse::MolFromSmiles(smile);
+  };
+  space.buildSynthonShapes(cancelled, params);
+  CHECK(smiles == std::vector<std::string>(expected.begin(), expected.end()));
+}
+
+TEST_CASE("Shape SMILES discovery handles empty spaces and worker errors") {
+  SynthonSpace space;
+  ShapeBuildParams params;
+  params.numThreads = 2;
+  bool cancelled = true;
+  CHECK(space.getSynthonShapeSmiles(cancelled, params).empty());
+  CHECK_FALSE(cancelled);
+  std::istringstream input(
+      "SMILES\tsynton_id\tsynton#\treaction_id\n"
+      "C[1*]\t1\t0\ttest\nN[1*]\t2\t1\ttest\n");
+  space.readStream(input, cancelled);
+  auto reaction = space.getReaction("test");
+  reaction->getSynthons()[0][0].second->getOrigMol()->getAtomWithIdx(0)
+      ->setNumExplicitHs(10);
+  CHECK_THROWS_AS(space.getSynthonShapeSmiles(cancelled, params),
+                  std::runtime_error);
+}
+
 TEST_CASE("Unmatched synthon") {
   // Checks that it deals with missing the whole 2nd synthon set
   std::string spaceText(

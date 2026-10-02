@@ -25,6 +25,7 @@
 
 #include <GraphMol/Chirality.h>
 #include <GraphMol/MolOps.h>
+#include <GraphMol/MolPickler.h>
 #include <GraphMol/QueryAtom.h>
 #include <GraphMol/ChemTransforms/ChemTransforms.h>
 #include <GraphMol/SmilesParse/SmartsWrite.h>
@@ -34,6 +35,7 @@
 #include <GraphMol/SynthonSpaceSearch/ProgressBar.h>
 #include <RDGeneral/ControlCHandler.h>
 #include <RDGeneral/RDThreads.h>
+#include <RDGeneral/versions.h>
 #include <SimDivPickers/LeaderPicker.h>
 #include <boost/variant2/variant.hpp>
 
@@ -1002,9 +1004,12 @@ bool hasUnspecifiedStereo(ROMol &mol) {
 }
 
 namespace {
-void useUserConfGen(std::unique_ptr<RWMol> &mol, unsigned int numConformers,
-                    UserConfGenerator &userConfGenerator) {
-  auto newMol = userConfGenerator(MolToSmiles(*mol), numConformers);
+void applyUserConformers(std::unique_ptr<RWMol> &mol,
+                         std::unique_ptr<RWMol> newMol) {
+  if (!newMol || !newMol->getNumConformers()) {
+    mol.reset();
+    return;
+  }
   // The mol has information that won't have survived, and it's not safe to
   // assume the atom orders have survived.
   MatchVectType res;
@@ -1059,6 +1064,12 @@ void useUserConfGen(std::unique_ptr<RWMol> &mol, unsigned int numConformers,
         mol->getProp<std::string>(common_properties::_Name));
   }
   mol.reset(newMol.release());
+}
+
+void useUserConfGen(std::unique_ptr<RWMol> &mol, unsigned int numConformers,
+                    UserConfGenerator &userConfGenerator) {
+  auto newMol = userConfGenerator(MolToSmiles(*mol), numConformers);
+  applyUserConformers(mol, std::move(newMol));
 }
 
 void useDefaultConfGen(std::unique_ptr<RWMol> &mol, unsigned int numConformers,
@@ -1160,7 +1171,6 @@ void splitDummyDummyBonds(RWMol &mol) {
 }  // namespace
 
 std::unique_ptr<RWMol> trimSampleMol(ROMol &mol, size_t molNum) {
-  auto ts = MolToCXSmiles(mol);
   boost::dynamic_bitset<> molNumAtoms(mol.getNumAtoms());
   unsigned int molNumProp;
   for (auto atom : mol.atoms()) {
@@ -1307,6 +1317,325 @@ void duplicateJoinIsotope(
 
 }  // namespace
 
+std::unique_ptr<SynthonShapeInput> makeSynthonShapes(
+    const ROMol &sampleMol, size_t synthonRole,
+    const std::string &synthonSmiles,
+    std::vector<std::unique_ptr<RWMol>> &isomerConfs,
+    const ShapeBuildParams &shapeBuildParams) {
+  std::unique_ptr<SynthonShapeInput> allShapes;
+  for (auto &isomer : isomerConfs) {
+    if (isomer->getNumConformers() == 0) {
+      continue;
+    }
+    std::vector<unsigned int> splitBonds;
+    std::vector<unsigned int> fragAtoms;
+    std::vector<std::pair<unsigned int, double>> dummyRadii;
+    std::vector<std::tuple<Atom *, Atom *, unsigned int>> atomIsotopes;
+    for (const auto &bond : isomer->bonds()) {
+      if (!bond->hasProp("molNum")) {
+        splitBonds.push_back(bond->getIdx());
+        if (!bond->getBeginAtom()->hasProp("molNum") ||
+            !bond->getEndAtom()->hasProp("molNum")) {
+          // Probably an explicit H added by the stereoisomer enumerator.
+          continue;
+        }
+        auto begMolNum = bond->getBeginAtom()->getProp<unsigned int>("molNum");
+        auto endMolNum = bond->getEndAtom()->getProp<unsigned int>("molNum");
+        if (begMolNum == synthonRole && endMolNum != synthonRole) {
+          fragAtoms.push_back(bond->getBeginAtomIdx());
+          fragAtoms.push_back(bond->getEndAtomIdx());
+          // Set the atom as a dummy, so it shows up in the shape.
+          auto joinIsotope = joinInCommon(
+              bond->getEndAtom()->getProp<std::string>("HoldsJoin"),
+              bond->getBeginAtom()->getProp<std::string>("HoldsJoin"));
+          atomIsotopes.emplace_back(bond->getEndAtom(), bond->getBeginAtom(),
+                                    joinIsotope);
+        } else if (begMolNum != synthonRole && endMolNum == synthonRole) {
+          fragAtoms.push_back(bond->getBeginAtomIdx());
+          fragAtoms.push_back(bond->getEndAtomIdx());
+          // Set the atom as a dummy, so it shows up in the shape.
+          auto joinIsotope = joinInCommon(
+              bond->getEndAtom()->getProp<std::string>("HoldsJoin"),
+              bond->getBeginAtom()->getProp<std::string>("HoldsJoin"));
+          atomIsotopes.emplace_back(bond->getBeginAtom(), bond->getEndAtom(),
+                                    joinIsotope);
+        }
+      } else {
+        if (bond->getProp<unsigned int>("molNum") == synthonRole) {
+          fragAtoms.push_back(bond->getBeginAtomIdx());
+          fragAtoms.push_back(bond->getEndAtomIdx());
+        }
+      }
+    }
+    setJoinIsotope(atomIsotopes, dummyRadii);
+    std::ranges::sort(fragAtoms);
+    fragAtoms.erase(std::unique(fragAtoms.begin(), fragAtoms.end()),
+                    fragAtoms.end());
+    GaussianShape::ShapeInputOptions shapeOpts;
+    shapeOpts.shapePruneThreshold = shapeBuildParams.shapeSimThreshold;
+    // Make custom features for the atom subset.  Doing it from the
+    // parent molecule means that the atom types will be correct which
+    // may not be the case after the fragment is extracted.  There might
+    // be a split aromatic ring, for example.
+    shapeOpts.customFeatures.reserve(isomer->getNumConformers());
+    for (auto cfi = isomer->beginConformers(); cfi != isomer->endConformers();
+         ++cfi) {
+      std::vector<GaussianShape::CustomFeature> feats;
+      GaussianShape::findFeatures(*(*cfi), feats, fragAtoms);
+      shapeOpts.customFeatures.emplace_back(std::move(feats));
+    }
+    duplicateJoinIsotope(*isomer, atomIsotopes, dummyRadii, fragAtoms);
+    shapeOpts.atomRadii = dummyRadii;
+    shapeOpts.atomSubset = fragAtoms;
+    splitDummyDummyBonds(*isomer);
+    try {
+      GaussianShape::ShapeOverlayOptions ovlyOpts;
+      if (!allShapes) {
+        allShapes = std::make_unique<SynthonShapeInput>(*isomer, -1, shapeOpts,
+                                                        ovlyOpts);
+      } else {
+        // Because stereoisomers should all have the same number of atoms and
+        // bonds, we can just combine the shapes into one set.  We don't need
+        // to keep track of which stereoisomer they came from.
+        allShapes->merge(SynthonShapeInput(*isomer, -1, shapeOpts, ovlyOpts));
+      }
+    } catch (ValueErrorException &e) {
+      // It throws an exception if it doesn't have a radius for an atom
+      // in the molecule.
+      BOOST_LOG(rdWarningLog) << e.what() << std::endl;
+    } catch (Invar::Invariant &e) {
+      std::ostringstream oss;
+      oss << e.what() << "\n"
+          << "No shapes generated for sample molecule "
+          << sampleMol.getProp<std::string>(common_properties::_Name) << " : "
+          << MolToSmiles(sampleMol)
+          << " when generating conformers for synthon " << synthonSmiles
+          << " with isomer : " << MolToSmiles(*isomer) << std::endl;
+      throw std::runtime_error(oss.str());
+    }
+  }
+  if (allShapes) {
+    if (isomerConfs.size() > 1) {
+      // allShapes will be the product of at least 1 merge, so prune.
+      allShapes->getShapes().pruneShapes(shapeBuildParams.shapeSimThreshold);
+    }
+  }
+  return allShapes;
+}
+
+#ifdef RDK_USE_BOOST_SERIALIZATION
+namespace {
+struct PreparedShapeMol {
+  std::string smiles;
+  std::string pickle;
+
+  template <typename Archive>
+  void serialize(Archive &archive, const unsigned int) {
+    archive & smiles & pickle;
+  }
+};
+
+struct PreparedShapeContext {
+  size_t role = 0;
+  std::vector<PreparedShapeMol> isomers;
+  PreparedShapeMol fallback;
+
+  template <typename Archive>
+  void serialize(Archive &archive, const unsigned int) {
+    archive & role & isomers & fallback;
+  }
+};
+
+std::string preparationSignature(const ShapeBuildParams &params) {
+  const auto &options = params.stereoEnumOpts;
+  std::ostringstream signature;
+  signature << "SynthonShapePreparation:1:" << rdkitVersion << ':'
+            << params.numConfs << ':' << params.maxSynthonAtoms << ':'
+            << options.onlyUnassigned << ':' << options.onlyStereoGroups << ':'
+            << options.unique << ':' << options.maxIsomers << ':'
+            << options.randomSeed << ':' << MAX_SHAPE_STEREOISOMERS;
+  return signature.str();
+}
+
+PreparedShapeMol prepareShapeMol(const ROMol &mol) {
+  PreparedShapeMol result;
+  result.smiles = MolToSmiles(mol);
+  MolPickler::pickleMol(mol, result.pickle,
+                        PicklerOps::AllProps | PicklerOps::NoConformers);
+  return result;
+}
+
+std::string readPreparationHeader(boost::archive::text_iarchive &archive,
+                                  const ShapeBuildParams &params) {
+  std::string signature, synthon;
+  archive >> signature >> synthon;
+  if (signature != preparationSignature(params)) {
+    throw std::invalid_argument(
+        "Incompatible synthon shape preparation record");
+  }
+  return synthon;
+}
+
+std::unique_ptr<RWMol> usePreparedConformers(const PreparedShapeMol &prepared,
+                                             ShapeBuildParams &params) {
+  auto conformers =
+      params.userConformerGenerator(prepared.smiles, params.numConfs);
+  if (!conformers || !conformers->getNumConformers()) {
+    return nullptr;
+  }
+  auto mol = std::make_unique<RWMol>(prepared.pickle);
+  applyUserConformers(mol, std::move(conformers));
+  if (mol && !mol->getNumConformers()) {
+    mol.reset();
+  }
+  return mol;
+}
+}  // namespace
+#endif
+
+std::pair<std::vector<std::string>, std::string> prepareSynthonShapeRecord(
+    const std::vector<std::unique_ptr<SampleMolRec>> &samples,
+    const ShapeBuildParams &params) {
+#ifndef RDK_USE_BOOST_SERIALIZATION
+  throw std::runtime_error("Shape preparation requires Boost serialization");
+#else
+  PRECONDITION(!samples.empty(), "No samples for shape preparation");
+  std::vector<PreparedShapeContext> contexts;
+  std::set<std::string> requests;
+  auto options = params.stereoEnumOpts;
+  options.tryEmbedding = false;
+  for (auto sample = samples.rbegin(); sample != samples.rend(); ++sample) {
+    if (ControlCHandler::getGotSignal()) {
+      return {};
+    }
+    auto product =
+        (*sample)->d_synthonSet->buildMolecule((*sample)->d_synthonNums);
+    if (!product) {
+      continue;
+    }
+    auto trimmed = trimSampleMol(*product, (*sample)->d_synthonSetNum);
+    PreparedShapeContext context;
+    context.role = (*sample)->d_synthonSetNum;
+    EnumerateStereoisomers::StereoisomerEnumerator enumerator(*trimmed,
+                                                              options);
+    for (unsigned int index = 0; index < MAX_SHAPE_STEREOISOMERS; ++index) {
+      auto isomer = enumerator.next();
+      if (!isomer) {
+        break;
+      }
+      context.isomers.push_back(prepareShapeMol(*isomer));
+      requests.insert(context.isomers.back().smiles);
+    }
+    context.fallback = prepareShapeMol(*trimmed);
+    requests.insert(context.fallback.smiles);
+    contexts.push_back(std::move(context));
+  }
+  std::ostringstream stream;
+  {
+    boost::archive::text_oarchive archive(stream);
+    archive << preparationSignature(params)
+            << samples.front()->d_synthon->getSmiles() << contexts;
+  }
+  return {{requests.begin(), requests.end()}, stream.str()};
+#endif
+}
+
+std::string getPreparedShapeSynthon(const std::string &record,
+                                    const ShapeBuildParams &params) {
+#ifndef RDK_USE_BOOST_SERIALIZATION
+  throw std::runtime_error("Shape preparation requires Boost serialization");
+#else
+  std::istringstream stream(record);
+  boost::archive::text_iarchive archive(stream);
+  return readPreparationHeader(archive, params);
+#endif
+}
+
+std::pair<std::string, std::unique_ptr<SynthonShapeInput>>
+buildSynthonShapeFromRecord(const std::string &record,
+                            ShapeBuildParams &params) {
+#ifndef RDK_USE_BOOST_SERIALIZATION
+  throw std::runtime_error("Shape preparation requires Boost serialization");
+#else
+  if (!params.userConformerGenerator) {
+    throw std::invalid_argument(
+        "Prepared assembly requires a conformer supplier");
+  }
+  std::istringstream stream(record);
+  boost::archive::text_iarchive archive(stream);
+  const auto synthonSmiles = readPreparationHeader(archive, params);
+  std::vector<PreparedShapeContext> contexts;
+  archive >> contexts;
+  stream >> std::ws;
+  if (!stream.eof()) {
+    throw std::invalid_argument("Trailing data in shape preparation record");
+  }
+  for (const auto &context : contexts) {
+    if (ControlCHandler::getGotSignal()) {
+      break;
+    }
+    std::vector<std::unique_ptr<RWMol>> isomers;
+    for (const auto &prepared : context.isomers) {
+      if (auto mol = usePreparedConformers(prepared, params)) {
+        isomers.push_back(std::move(mol));
+      }
+    }
+    if (isomers.empty()) {
+      if (auto mol = usePreparedConformers(context.fallback, params)) {
+        isomers.push_back(std::move(mol));
+      }
+    }
+    if (!isomers.empty()) {
+      RWMol sample(context.fallback.pickle);
+      if (auto shapes = makeSynthonShapes(sample, context.role, synthonSmiles,
+                                          isomers, params)) {
+        return {synthonSmiles, std::move(shapes)};
+      }
+    }
+  }
+  return {synthonSmiles, nullptr};
+#endif
+}
+
+std::pair<std::string, std::vector<std::string>> getSynthonShapePreparationInfo(
+    const std::string &record, const ShapeBuildParams &params) {
+#ifndef RDK_USE_BOOST_SERIALIZATION
+  throw std::runtime_error("Shape preparation requires Boost serialization");
+#else
+  std::istringstream stream(record);
+  boost::archive::text_iarchive archive(stream);
+  auto synthon = readPreparationHeader(archive, params);
+  std::vector<PreparedShapeContext> contexts;
+  archive >> contexts;
+  stream >> std::ws;
+  if (!stream.eof()) {
+    throw std::invalid_argument("Trailing data in shape preparation record");
+  }
+  std::set<std::string> requests;
+  for (const auto &context : contexts) {
+    for (const auto &isomer : context.isomers) {
+      requests.insert(isomer.smiles);
+    }
+    requests.insert(context.fallback.smiles);
+  }
+  return {std::move(synthon), {requests.begin(), requests.end()}};
+#endif
+}
+
+void buildSynthonShapesFromRecord(Synthon &synthon, const std::string &record,
+                                  ShapeBuildParams &params) {
+  if (getPreparedShapeSynthon(record, params) != synthon.getSmiles()) {
+    throw std::invalid_argument(
+        "Shape preparation record has the wrong synthon");
+  }
+  if (!synthon.getShapes()) {
+    auto result = buildSynthonShapeFromRecord(record, params);
+    if (result.second) {
+      synthon.setShapes(std::move(result.second));
+    }
+  }
+}
+
 void makeShapesFromMol(std::vector<std::unique_ptr<SampleMolRec>> &sampleMols,
                        std::atomic<std::int64_t> &mostRecentMol,
                        DGeomHelpers::EmbedParameters &dgParams,
@@ -1317,141 +1646,35 @@ void makeShapesFromMol(std::vector<std::unique_ptr<SampleMolRec>> &sampleMols,
     if (molNum >= sampleMols.size()) {
       return;
     }
-    sampleMols[molNum]->d_mol = sampleMols[molNum]->d_synthonSet->buildMolecule(
-        sampleMols[molNum]->d_synthonNums);
-    if (!sampleMols[molNum]->d_mol) {
+    auto &sample = *sampleMols[molNum];
+    sample.d_mol = sample.d_synthonSet->buildMolecule(sample.d_synthonNums);
+    if (!sample.d_mol) {
       continue;
     }
-    sampleMols[molNum]->d_mol = trimSampleMol(
-        *sampleMols[molNum]->d_mol, sampleMols[molNum]->d_synthonSetNum);
-    constexpr unsigned int maxStereoCentresToDo =
-        3;  // Don't enumerate more than 3 stereo centres
+    sample.d_mol = trimSampleMol(*sample.d_mol, sample.d_synthonSetNum);
     auto isomerConfs = generateIsomerConformers(
-        *sampleMols[molNum]->d_mol, shapeBuildParams.numConfs, true,
+        *sample.d_mol, shapeBuildParams.numConfs, true,
         shapeBuildParams.stereoEnumOpts, dgParams,
-        shapeBuildParams.userConformerGenerator, maxStereoCentresToDo);
+        shapeBuildParams.userConformerGenerator, MAX_SHAPE_STEREOISOMERS);
     if (isomerConfs.empty()) {
-      // Sometimes we can get something from the un-enumerated isomers which
-      // will be better than nothing.
       isomerConfs = generateIsomerConformers(
-          *sampleMols[molNum]->d_mol, shapeBuildParams.numConfs, false,
+          *sample.d_mol, shapeBuildParams.numConfs, false,
           shapeBuildParams.stereoEnumOpts, dgParams,
-          shapeBuildParams.userConformerGenerator, maxStereoCentresToDo);
+          shapeBuildParams.userConformerGenerator, MAX_SHAPE_STEREOISOMERS);
       if (isomerConfs.empty()) {
         BOOST_LOG(rdWarningLog)
             << "No conformers generated for sample molecule "
-            << sampleMols[molNum]->d_mol->getProp<std::string>(
-                   common_properties::_Name)
-            << " : " << MolToSmiles(*sampleMols[molNum]->d_mol)
+            << sample.d_mol->getProp<std::string>(common_properties::_Name)
+            << " : " << MolToSmiles(*sample.d_mol)
             << " when generating conformers for synthon "
-            << sampleMols[molNum]->d_synthon->getSmiles() << std::endl;
+            << sample.d_synthon->getSmiles() << std::endl;
         continue;
       }
     }
-    std::unique_ptr<SynthonShapeInput> allShapes;
-    for (auto &isomer : isomerConfs) {
-      if (isomer->getNumConformers() == 0) {
-        continue;
-      }
-      std::vector<unsigned int> splitBonds;
-      std::vector<unsigned int> fragAtoms;
-      std::vector<std::pair<unsigned int, double>> dummyRadii;
-      std::vector<std::tuple<Atom *, Atom *, unsigned int>> atomIsotopes;
-      for (const auto &bond : isomer->bonds()) {
-        if (!bond->hasProp("molNum")) {
-          splitBonds.push_back(bond->getIdx());
-          if (!bond->getBeginAtom()->hasProp("molNum") ||
-              !bond->getEndAtom()->hasProp("molNum")) {
-            // Probably an explicit H added by the stereoisomer enumerator.
-            continue;
-          }
-          auto begMolNum =
-              bond->getBeginAtom()->getProp<unsigned int>("molNum");
-          auto endMolNum = bond->getEndAtom()->getProp<unsigned int>("molNum");
-          if (begMolNum == sampleMols[molNum]->d_synthonSetNum &&
-              endMolNum != sampleMols[molNum]->d_synthonSetNum) {
-            fragAtoms.push_back(bond->getBeginAtomIdx());
-            fragAtoms.push_back(bond->getEndAtomIdx());
-            // Set the atom as a dummy, so it shows up in the shape.
-            auto joinIsotope = joinInCommon(
-                bond->getEndAtom()->getProp<std::string>("HoldsJoin"),
-                bond->getBeginAtom()->getProp<std::string>("HoldsJoin"));
-            atomIsotopes.emplace_back(bond->getEndAtom(), bond->getBeginAtom(),
-                                      joinIsotope);
-          } else if (begMolNum != sampleMols[molNum]->d_synthonSetNum &&
-                     endMolNum == sampleMols[molNum]->d_synthonSetNum) {
-            fragAtoms.push_back(bond->getBeginAtomIdx());
-            fragAtoms.push_back(bond->getEndAtomIdx());
-            // Set the atom as a dummy, so it shows up in the shape.
-            auto joinIsotope = joinInCommon(
-                bond->getEndAtom()->getProp<std::string>("HoldsJoin"),
-                bond->getBeginAtom()->getProp<std::string>("HoldsJoin"));
-            atomIsotopes.emplace_back(bond->getBeginAtom(), bond->getEndAtom(),
-                                      joinIsotope);
-          }
-        } else {
-          if (bond->getProp<unsigned int>("molNum") ==
-              sampleMols[molNum]->d_synthonSetNum) {
-            fragAtoms.push_back(bond->getBeginAtomIdx());
-            fragAtoms.push_back(bond->getEndAtomIdx());
-          }
-        }
-      }
-      setJoinIsotope(atomIsotopes, dummyRadii);
-      std::ranges::sort(fragAtoms);
-      fragAtoms.erase(std::unique(fragAtoms.begin(), fragAtoms.end()),
-                      fragAtoms.end());
-      GaussianShape::ShapeInputOptions shapeOpts;
-      shapeOpts.shapePruneThreshold = shapeBuildParams.shapeSimThreshold;
-      // Make custom features for the atom subset.  Doing it from the
-      // parent molecule means that the atom types will be correct which
-      // may not be the case after the fragment is extracted.  There might
-      // be a split aromatic ring, for example.
-      shapeOpts.customFeatures.reserve(isomer->getNumConformers());
-      for (auto cfi = isomer->beginConformers(); cfi != isomer->endConformers();
-           ++cfi) {
-        std::vector<GaussianShape::CustomFeature> feats;
-        GaussianShape::findFeatures(*(*cfi), feats, fragAtoms);
-        shapeOpts.customFeatures.emplace_back(std::move(feats));
-      }
-      duplicateJoinIsotope(*isomer, atomIsotopes, dummyRadii, fragAtoms);
-      shapeOpts.atomRadii = dummyRadii;
-      shapeOpts.atomSubset = fragAtoms;
-      splitDummyDummyBonds(*isomer);
-      try {
-        GaussianShape::ShapeOverlayOptions ovlyOpts;
-        if (!allShapes) {
-          allShapes = std::make_unique<SynthonShapeInput>(*isomer, -1,
-                                                          shapeOpts, ovlyOpts);
-        } else {
-          // Because stereoisomers should all have the same number of atoms and
-          // bonds, we can just combine the shapes into one set.  We don't need
-          // to keep track of which stereoisomer they came from.
-          allShapes->merge(SynthonShapeInput(*isomer, -1, shapeOpts, ovlyOpts));
-        }
-      } catch (ValueErrorException &e) {
-        // It throws an exception if it doesn't have a radius for an atom
-        // in the molecule.
-        BOOST_LOG(rdWarningLog) << e.what() << std::endl;
-      } catch (Invar::Invariant &e) {
-        std::ostringstream oss;
-        oss << e.what() << "\n"
-            << "No shapes generated for sample molecule "
-            << sampleMols[molNum]->d_mol->getProp<std::string>(
-                   common_properties::_Name)
-            << " : " << MolToSmiles(*sampleMols[molNum]->d_mol)
-            << " when generating conformers for synthon "
-            << sampleMols[molNum]->d_synthon->getSmiles()
-            << " with isomer : " << MolToSmiles(*isomer) << std::endl;
-        throw std::runtime_error(oss.str());
-      }
-    }
-    if (allShapes) {
-      if (isomerConfs.size() > 1) {
-        // allShapes will be the product of at least 1 merge, so prune.
-        allShapes->getShapes().pruneShapes(shapeBuildParams.shapeSimThreshold);
-      }
-      sampleMols[molNum]->d_synthon->setShapes(std::move(allShapes));
+    if (auto shapes = makeSynthonShapes(*sample.d_mol, sample.d_synthonSetNum,
+                                        sample.d_synthon->getSmiles(),
+                                        isomerConfs, shapeBuildParams)) {
+      sample.d_synthon->setShapes(std::move(shapes));
     }
     if (pbar) {
       pbar->increment();

@@ -15,6 +15,7 @@
 #include <random>
 #include <algorithm>
 #include <execution>
+#include <future>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -47,6 +48,35 @@ bool checkMolsHaveRoughlySameCoords(const ROMol &m1, const ROMol &m2,
     }
   }
   return true;
+}
+
+TEST_CASE("parallel feature initialization") {
+  auto mol = v2::SmilesParse::MolFromSmiles("NC(=O)c1ccc(O)cc1");
+  REQUIRE(mol);
+  mol->addConformer(new Conformer(mol->getNumAtoms()));
+  std::promise<void> start;
+  auto ready = start.get_future().share();
+  std::vector<std::future<size_t>> workers;
+  for (unsigned int worker = 0; worker < 16; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, ready]() {
+      RWMol copy(*mol);
+      ready.wait();
+      std::vector<GaussianShape::CustomFeature> features;
+      GaussianShape::findFeatures(copy.getConformer(), features);
+      return features.size();
+    }));
+  }
+  start.set_value();
+  std::vector<size_t> counts;
+  for (auto &worker : workers) {
+    counts.push_back(worker.get());
+  }
+  std::vector<GaussianShape::CustomFeature> expected;
+  GaussianShape::findFeatures(mol->getConformer(), expected);
+  REQUIRE(!expected.empty());
+  for (auto count : counts) {
+    CHECK(count == expected.size());
+  }
 }
 
 TEST_CASE("basic alignment") {
