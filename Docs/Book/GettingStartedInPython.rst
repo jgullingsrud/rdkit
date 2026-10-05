@@ -3445,6 +3445,181 @@ same generator is used for database preparation and the subsequent searching but
 The query molecule can be in 1 or 2 unconnected pieces.  The latter case is intended for use in Fragment-Based Drug
 Design (FBDD) to find molecules that can connect 2 fragments in different pockets.
 
+.. _parallel-synthon-shape-construction:
+
+Separating Shape Database Construction
+----------------------------------------
+
+Shape database construction can be separated into preparation, conformer generation,
+per-synthon shape construction, and final database writing. The expensive worker steps
+do not need a ``SynthonSpace`` object: their inputs are strings, settings, and serialized
+molecules or preparation records. This makes it possible to run them in separate
+processes or on different machines without changing the chemistry or context-selection
+rules. The following example runs everything serially to illustrate the interfaces;
+it uses only RDKit and the Python standard library. These APIs are currently exposed
+by the Boost.Python bindings.
+
+First create a small shape-free binary database from the example library. To use an
+existing shape-free binary database, set ``source_path`` to that file and omit the
+initial ``ReadTextFile``/``WriteDBFile`` conversion. The checksum identifies the exact
+source database; the same source must be used for final writing.
+The settings dictionary will also be passed to each worker, rather than passing a
+wrapped C++ parameter object between processes.
+
+.. doctest:: synthon-shape-construction
+
+  >>> import hashlib
+  >>> import os
+  >>> from pathlib import Path
+  >>> from tempfile import TemporaryDirectory
+  >>> from rdkit import Chem
+  >>> from rdkit.Chem import rdDistGeom, rdEnumerateStereoisomers, rdSynthonSpaceSearch
+  >>> settings = {"num_confs": 10, "seed": 3500, "rms_threshold": 0.5}
+  >>> def shape_parameters(settings):
+  ...     params = rdSynthonSpaceSearch.ShapeBuildParams()
+  ...     params.numConfs = settings["num_confs"]
+  ...     params.randomSeed = settings["seed"]
+  ...     params.rmsThreshold = settings["rms_threshold"]
+  ...     params.numThreads = 1
+  ...     stereo = rdEnumerateStereoisomers.StereoEnumerationOptions()
+  ...     stereo.randomSeed = settings["seed"]
+  ...     stereo.tryEmbedding = False
+  ...     params.stereoEnumOpts = stereo
+  ...     return params
+  >>> def database_digest(path):
+  ...     with open(path, "rb") as stream:
+  ...         digest = hashlib.sha256()
+  ...         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+  ...             digest.update(chunk)
+  ...     return digest.hexdigest()
+  >>> scratch = TemporaryDirectory()
+  >>> source_path = Path(scratch.name) / "synthons.spc"
+  >>> text_path = Path(os.environ["RDBASE"]) / "Code/GraphMol/SynthonSpaceSearch/data/amide_space.txt"
+  >>> initial = rdSynthonSpaceSearch.SynthonSpace()
+  >>> initial.ReadTextFile(str(text_path))
+  >>> initial.WriteDBFile(str(source_path))
+  >>> del initial
+  >>> source = rdSynthonSpaceSearch.SynthonSpace()
+  >>> source.ReadDBFile(str(source_path))
+  >>> assert source.GetNumSynthonsWithShapes() == 0
+  >>> source_digest = database_digest(source_path)
+
+``PrepareSynthonShapes`` calls ``collect`` with the required SMILES and one opaque
+byte record for each eligible synthon. Each record retains the annotated molecules,
+stereoisomers, and ordered fallback contexts needed later. Preparation does not embed
+conformers. A SMILES can be needed by several synthons, so conformer requests are
+deduplicated separately from preparation records. The requested conformer count is
+part of the cache key.
+
+.. doctest:: synthon-shape-construction
+
+  >>> records = []
+  >>> requests = set()
+  >>> def collect(smiles, record):
+  ...     records.append(record)
+  ...     requests.update((smile, settings["num_confs"]) for smile in smiles)
+  >>> source.PrepareSynthonShapes(shape_parameters(settings), collect)
+  >>> assert source.GetNumSynthonsWithShapes() == 0
+  >>> del source
+
+Here is a conformer worker. It returns a molecule pickle on success, or ``None`` when
+embedding produces no conformers. Returning a pickle allows another process to use
+the coordinates without depending on the worker's Python molecule object. Double
+precision preserves the generated coordinates during transfer. A per-request seed
+makes generation independent of scheduling order on a given RDKit build.
+
+.. doctest:: synthon-shape-construction
+
+  >>> def generate_conformers(request, settings):
+  ...     smiles, count = request
+  ...     mol = Chem.MolFromSmiles(smiles)
+  ...     if mol is None:
+  ...         raise ValueError("Invalid conformer request")
+  ...     mol = Chem.AddHs(mol)
+  ...     params = rdDistGeom.ETKDGv3()
+  ...     seed = hashlib.sha256(f'{settings["seed"]}:{smiles}:{count}'.encode()).digest()
+  ...     params.randomSeed = int.from_bytes(seed[:4], "little") % (2**31 - 1)
+  ...     params.numThreads = 1
+  ...     params.pruneRmsThresh = settings["rms_threshold"]
+  ...     conformer_ids = rdDistGeom.EmbedMultipleConfs(mol, count, params)
+  ...     if not len(conformer_ids):
+  ...         return request, None
+  ...     mol = Chem.RemoveHs(mol)
+  ...     return request, mol.ToBinary(Chem.PropertyPickleOptions.CoordsAsDouble)
+  >>> conformers = dict(generate_conformers(request, settings) for request in sorted(requests))
+
+The shape worker receives only one preparation record and the conformers that record
+requires. It does not load the synthon database. The supplier must distinguish an
+explicit embedding failure (``None``) from an absent result (a missing dictionary key
+here). ``BuildSynthonShapeFromPreparation`` tries the stored contexts in the existing
+preference order, combines the relevant stereoisomer shapes, and prunes them. Its
+result is a synthon key and serialized shape bytes; an empty shape payload means that
+no context succeeded. Thus results can arrive in any order without changing which
+context is selected for a synthon.
+
+.. doctest:: synthon-shape-construction
+
+  >>> def build_shapes(job):
+  ...     settings, source_digest, record, payloads = job
+  ...     def supply(smiles, count):
+  ...         return payloads[(smiles, count)]
+  ...     target, shapes = rdSynthonSpaceSearch.BuildSynthonShapeFromPreparation(
+  ...         shape_parameters(settings), record, supply)
+  ...     return source_digest, target, shapes
+  >>> jobs = []
+  >>> expected_targets = set()
+  >>> for record in records:
+  ...     target, smiles = rdSynthonSpaceSearch.GetSynthonShapePreparationInfo(
+  ...         shape_parameters(settings), record)
+  ...     assert target not in expected_targets
+  ...     expected_targets.add(target)
+  ...     needed = {(smile, settings["num_confs"]) for smile in smiles}
+  ...     payloads = {request: conformers[request] for request in needed}
+  ...     jobs.append((settings, source_digest, record, payloads))
+  >>> results = [build_shapes(job) for job in jobs]
+
+Finally, reload the original binary database and attach the completed shapes. Only
+this stage needs the whole database again. ``SetSynthonShapes`` deserializes the shapes;
+it does not repeat molecular preparation, conformer generation, or shape construction.
+Check source identity and result coverage before writing, including results with
+empty shape payloads. This example deliberately reverses the result order.
+
+.. doctest:: synthon-shape-construction
+
+  >>> assert database_digest(source_path) == source_digest
+  >>> assert all(digest == source_digest for digest, target, shapes in results)
+  >>> assert len(results) == len(expected_targets)
+  >>> assert {target for digest, target, shapes in results} == expected_targets
+  >>> finished = rdSynthonSpaceSearch.SynthonSpace()
+  >>> finished.ReadDBFile(str(source_path))
+  >>> finished.SetSynthonShapes(
+  ...     [(target, shapes) for digest, target, shapes in reversed(results)],
+  ...     settings["num_confs"])
+  >>> output_path = Path(scratch.name) / "synthons_with_shapes.spc"
+  >>> finished.WriteDBFile(str(output_path))
+  >>> restored = rdSynthonSpaceSearch.SynthonSpace()
+  >>> restored.ReadDBFile(str(output_path))
+  >>> assert restored.GetNumSynthons() == finished.GetNumSynthons()
+  >>> assert restored.GetNumProducts() == finished.GetNumProducts()
+  >>> assert restored.GetNumSynthonsWithShapes() == finished.GetNumSynthonsWithShapes()
+  >>> assert restored.GetNumSynthonsWithShapes() > 0
+  >>> scratch.cleanup()
+
+To parallelize this example, replace the calls to ``generate_conformers`` and
+``build_shapes`` with tasks in the chosen executor or job system. Keep the worker
+functions in an importable module when using processes. Their job data contains no
+``SynthonSpace`` or other wrapped C++ objects. All workers must use compatible RDKit
+builds and identical settings. Match results to their jobs and validate provenance;
+do not silently omit missing jobs or accept conflicting retries.
+
+Keeping every record and conformer in dictionaries is convenient for this tiny
+example, but not for a large library. Stream preparation records, use a disk or object
+store for conformers, and batch jobs to amortize scheduling overhead. Conformers shared
+between jobs may need to be transferred more than once. The source database still
+needs to fit in memory during preparation and final writing, and database I/O remains
+a serial cost. The conformer supplier must return the same chemical structure as
+requested; RDKit transfers the saved atom annotations onto the supplied conformers.
+
 Limiting Hits
 =============
 
