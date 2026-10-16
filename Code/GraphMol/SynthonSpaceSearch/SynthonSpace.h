@@ -356,6 +356,28 @@ class RDKIT_SYNTHONSPACESEARCH_EXPORT SynthonSpace {
       const ROMol &query, const SearchResultCallback &callback,
       const SynthonSpaceSearchParams &params = SynthonSpaceSearchParams());
 
+  /*! Stream unvalidated (synthon SMILES, product name) pairs after each
+   * reaction's parallel fragment search. Returning true from callback stops
+   * discovery. Records must be copied if retained beyond the callback.
+   * toTryChunkSize controls candidate screening batches; maxPossibleHitsToWrite
+   * limits emitted records. maxHits and buildHits are ignored. randomSample,
+   * hitStart, and possibleHitsFile are unsupported. Duplicates across batches
+   * are possible, as in possible-hit files. No conformers are generated.
+   * The result contains no molecules, only discovery statistics; its upper
+   * bound covers the reactions searched, not any reactions skipped on stop.
+   */
+  SearchResults shapeSearchCandidates(
+      const ROMol &query, const SearchCandidateCallback &callback,
+      const SynthonSpaceSearchParams &params = SynthonSpaceSearchParams());
+
+  /*! Validate candidate records without a synthon database, using the same
+   * conformer generation and scoring as possible-hit-file validation.
+   * All supplied records are checked; maxHits and hitStart are not applied.
+   */
+  SearchResults validateShapeCandidates(
+      const ROMol &query, const std::vector<SearchCandidate> &candidates,
+      const SynthonSpaceSearchParams &params = SynthonSpaceSearchParams());
+
   /*! Take the contents of params.possibleHitsFile, which is assumed to have
    * been written by an earlier search, and extract those that are indeed
    * hits.  It makes sense that params is the same as the one used to

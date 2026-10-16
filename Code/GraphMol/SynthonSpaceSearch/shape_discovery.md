@@ -180,6 +180,95 @@ The existing `overlay/sitecustomize.py` remains the Python import hook. No insta
 wheel was modified. Deployment requires a rebuilt RDKit package providing these
 APIs; unsupported builds, bounded runs, and `parallel_shapes=False` use local assembly.
 
+## Streaming Search Candidates
+
+`space.ShapeSearchCandidates(query, callback, params)` screens a query against
+an existing shape database without constructing product conformers or validating
+final hits. Each callback receives a list of `(synthon_smiles, product_name)`
+pairs, using the same representation as a possible-hit file. The SMILES retain
+the isotope-labeled connectors; they are not assembled product SMILES.
+
+Query preparation still happens up front. Each reaction's fragment search uses
+`params.numThreads`; after those threads join, the calling thread screens and
+emits that reaction's candidates before searching the next reaction. Callbacks
+are serial and can block to apply backpressure. The GIL is released during native
+work and reacquired for Python callbacks. Return `True` to stop discovery or
+`False`/`None` to continue. Callback exceptions propagate, and interruption raises
+`KeyboardInterrupt`. Already delivered batches remain usable.
+
+`params.toTryChunkSize` controls candidate screening batches, not the number of
+successful matches; its default of 2,500,000 can delay delivery within a large
+reaction. `params.maxPossibleHitsToWrite` caps emitted candidate records.
+`maxHits`, `buildHits`, and `writePossibleHitsAndStop` are ignored by this API;
+`randomSample`, `hitStart`, and `possibleHitsFile` are rejected. Records are not
+ranked and duplicates across batches can occur, just as with possible-hit files.
+The returned result has no hit molecules; `GetTimedOut()` reports timeout and
+`GetMaxNumResults()` is the candidate upper bound for reactions actually searched.
+That upper bound does not cover unsearched reactions after an early stop.
+
+Workers can call `SynthonSpace().ValidateShapeCandidates(query, batch, params)`
+without loading a database. This checks every supplied record and returns the
+usual search result with scored conformers. It shares the file-based validation
+implementation; `maxHits` and `hitStart` do not limit a validation batch. It does
+not preserve the pre-aligned starting conformer of monolithic shape search, so
+the two-stage file workflow, not monolithic search, is the parity reference.
+
+For example, in an importable Python script, use spawned workers and bound the
+number of outstanding batches. Here `query` has a 3D conformer and `space` is an
+already-loaded shape database:
+
+```python
+import multiprocessing
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from rdkit import Chem
+from rdkit.Chem import rdSynthonSpaceSearch
+
+
+def validate_batch(query, batch):
+	params = rdSynthonSpaceSearch.SynthonSpaceSearchParams()
+	params.numThreads = 1
+	params.similarityCutoff = 0.8
+	params.randomSeed = 3500
+	worker = rdSynthonSpaceSearch.SynthonSpace()
+	hits = worker.ValidateShapeCandidates(query, batch, params).GetHitMolecules()
+	return [mol.ToBinary(Chem.PropertyPickleOptions.AllProps) for mol in hits]
+
+
+def write_hits(space, query, output):
+	params = rdSynthonSpaceSearch.SynthonSpaceSearchParams()
+	params.numThreads = 4
+	params.toTryChunkSize = 256
+	params.similarityCutoff = 0.8
+	params.randomSeed = 3500
+	pending = deque()
+	with ProcessPoolExecutor(max_workers=4,
+							 mp_context=multiprocessing.get_context("spawn")) as pool:
+		with Chem.SDWriter(output) as writer:
+			def drain_one():
+				for binary in pending.popleft().result():
+					writer.write(Chem.Mol(binary))
+				writer.flush()
+
+			def submit(batch):
+				if len(pending) >= 8:
+					drain_one()
+				pending.append(pool.submit(validate_batch, query, batch))
+
+			summary = space.ShapeSearchCandidates(query, submit, params)
+			while pending:
+				drain_one()
+	return summary
+```
+
+Call `write_hits` under an `if __name__ == "__main__":` guard. Configure the same
+query, scoring, stereo, and excluded-volume settings on every worker. RDKit
+molecule pickling does not preserve arbitrary properties by default; the example
+returns explicit molecule-pickle bytes with all properties to preserve names and
+scores across processes.
+The application owns deduplication, final ranking, accepted-hit limits, retries,
+and the combined discovery/validation CPU budget.
+
 ## Local Development Build
 
 The benchmark and runtime-test results above were obtained on `Release_2026_03_6`

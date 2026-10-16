@@ -15,6 +15,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -303,6 +304,51 @@ SynthonSpaceSearch::SearchResults shapeSearch_helper(
   }
   if (results.getCancelled()) {
     throwCancelled("ShapeSearch cancelled");
+  }
+  return results;
+}
+
+SynthonSpaceSearch::SearchResults shapeSearchCandidates_helper(
+    SynthonSpaceSearch::SynthonSpace &self, const ROMol &query,
+    const nb::object &callback,
+    const std::optional<SynthonSpaceSearch::SynthonSpaceSearchParams> &py_params) {
+  if (!PyCallable_Check(callback.ptr())) {
+    throw nb::type_error("callback must be callable");
+  }
+  const auto params =
+      py_params.value_or(SynthonSpaceSearch::SynthonSpaceSearchParams());
+  SynthonSpaceSearch::SearchResults results;
+  {
+    NOGIL gil;
+    results = self.shapeSearchCandidates(query, [&](const auto &candidates) {
+      nb::gil_scoped_acquire acquire;
+      nb::list batch;
+      for (const auto &[smiles, name] : candidates) {
+        batch.append(nb::make_tuple(smiles, name));
+      }
+      nb::object stop = callback(batch);
+      return !stop.is_none() && nb::cast<bool>(stop);
+    }, params);
+  }
+  if (results.getCancelled()) {
+    throwCancelled("ShapeSearchCandidates cancelled");
+  }
+  return results;
+}
+
+SynthonSpaceSearch::SearchResults validateShapeCandidates_helper(
+    SynthonSpaceSearch::SynthonSpace &self, const ROMol &query,
+    const std::vector<SynthonSpaceSearch::SearchCandidate> &candidates,
+    const std::optional<SynthonSpaceSearch::SynthonSpaceSearchParams> &py_params) {
+  SynthonSpaceSearch::SearchResults results;
+  {
+    NOGIL gil;
+    results = self.validateShapeCandidates(
+        query, candidates,
+        py_params.value_or(SynthonSpaceSearch::SynthonSpaceSearchParams()));
+  }
+  if (results.getCancelled()) {
+    throwCancelled("ValidateShapeCandidates cancelled");
   }
   return results;
 }
@@ -810,8 +856,25 @@ params is ignored.  Returns results iteratively in the callback.)DOC")
 across the synthonspace library.  Duplicate SMILES strings produced by
 different reactions will be returned.  Requires a query with at least
 1 3D conformer.  Only the first conformer will be used in the search.)DOC")
-      .def(
-          "ShapeSearch", &shapeSearch_helper3, "query"_a, "params"_a,
+       .def("ShapeSearchCandidates", &shapeSearchCandidates_helper, "query"_a,
+         "callback"_a, "params"_a = nb::none(),
+         "Stream lists of (synthon SMILES, product name) pairs without product"
+         " conformer generation. Fragment searches use params.numThreads;"
+         " callbacks run serially on the calling thread after each reaction."
+         " Return True to stop, False or None to continue. Exceptions propagate."
+         " toTryChunkSize controls screening batches; maxPossibleHitsToWrite"
+         " limits emitted records. maxHits, buildHits and writePossibleHitsAndStop"
+         " are ignored. randomSample, hitStart and possibleHitsFile are unsupported."
+         " Duplicates across batches are possible; results are not ranked."
+         " Returns discovery statistics without hit molecules; GetMaxNumResults"
+         " covers only the reactions searched when stopped early.")
+       .def("ValidateShapeCandidates", &validateShapeCandidates_helper, "query"_a,
+         "candidates"_a, "params"_a = nb::none(),
+         "Validate (synthon SMILES, product name) pairs using conformer generation"
+         " and shape scoring, as for possible-hit-file validation. No database"
+         " is required. All records are checked; maxHits and hitStart are ignored.")
+       .def(
+        "ShapeSearch", &shapeSearch_helper3, "query"_a, "params"_a,
           "startLine"_a, "finishLine"_a,
           R"DOC(Take the contents of params.possibleHitsFile, which is assumed to have
 been written by an earlier search, and extract those that are indeed

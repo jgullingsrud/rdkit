@@ -353,6 +353,27 @@ void SynthonSpace::shapeSearch(const ROMol &query,
   ssss.search(cb, ThreadMode::ThreadFragments);
 }
 
+SearchResults SynthonSpace::shapeSearchCandidates(
+    const ROMol &query, const SearchCandidateCallback &callback,
+    const SynthonSpaceSearchParams &params) {
+  PRECONDITION(query.getNumAtoms() != 0, "Search query must contain atoms.");
+  std::vector<std::vector<int>> fragments;
+  const auto numFragments = MolOps::getMolFrags(query, fragments);
+  auto queryCopy = numFragments > 1
+                       ? addZeroOrderBondsBetweenFrags(query, fragments)
+                       : std::make_unique<RWMol>(query);
+  SynthonSpaceShapeSearcher searcher(*queryCopy, params, this);
+  return searcher.searchCandidates(callback);
+}
+
+SearchResults SynthonSpace::validateShapeCandidates(
+    const ROMol &query, const std::vector<SearchCandidate> &candidates,
+    const SynthonSpaceSearchParams &params) {
+  PRECONDITION(query.getNumAtoms() != 0, "Search query must contain atoms.");
+  SynthonSpaceShapeSearcher searcher(query, params, nullptr);
+  return searcher.checkPossibleHits(candidates);
+}
+
 SearchResults SynthonSpace::shapeSearch(const ROMol &query,
                                         const SynthonSpaceSearchParams &params,
                                         std::uint64_t startLine,

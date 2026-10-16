@@ -8,6 +8,8 @@
 //  of the RDKit source tree.
 
 #include <filesystem>
+#include <csignal>
+#include <thread>
 
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/FileParsers/MolSupplier.h>
@@ -151,6 +153,47 @@ TEST_CASE("Shape Callback Version") {
       };
   synthonspace.shapeSearch(*queryMol, cb, params);
   CHECK(resSmi.size() == 3);
+
+  SECTION("Candidate callbacks skip validation") {
+    params.numThreads = GENERATE(1, 2);
+    params.toTryChunkSize = 1;
+    params.userConformerGenerator = [](const std::string &, unsigned int)
+        -> std::unique_ptr<RWMol> {
+      throw std::runtime_error("Candidate discovery generated conformers");
+    };
+    const auto caller = std::this_thread::get_id();
+    std::vector<SearchCandidate> candidates;
+    auto summary = synthonspace.shapeSearchCandidates(
+        *queryMol,
+        [&](const auto &batch) {
+          CHECK(std::this_thread::get_id() == caller);
+          REQUIRE(batch.size() == 1);
+          candidates.insert(candidates.end(), batch.begin(), batch.end());
+          return false;
+        },
+        params);
+    CHECK(candidates.size() > 1);
+    CHECK(summary.getHitMolecules().empty());
+    CHECK_FALSE(summary.getTimedOut());
+    CHECK_FALSE(summary.getCancelled());
+
+    size_t calls = 0;
+    synthonspace.shapeSearchCandidates(
+        *queryMol, [&](const auto &) { ++calls; return true; }, params);
+    CHECK(calls == 1);
+
+    summary = synthonspace.shapeSearchCandidates(
+        *queryMol,
+        [](const auto &) {
+          std::raise(SIGINT);
+          return false;
+        },
+        params);
+    CHECK(summary.getCancelled());
+    summary = synthonspace.shapeSearchCandidates(
+        *queryMol, [](const auto &) { return true; }, params);
+    CHECK_FALSE(summary.getCancelled());
+  }
 }
 
 TEST_CASE("Shape DB Writer") {

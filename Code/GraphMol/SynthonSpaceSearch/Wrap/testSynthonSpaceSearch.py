@@ -37,6 +37,7 @@ import tempfile
 import time
 import unittest
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from pathlib import Path
@@ -511,6 +512,152 @@ class TestCase(unittest.TestCase):
     hits = synthonspace.ShapeSearch(query, ssparams)
     self.assertEqual(len(hits.GetHitMolecules()), 2)
 
+
+  def makeCandidateFixture(self):
+    space = rdSynthonSpaceSearch.SynthonSpace()
+    with tempfile.TemporaryDirectory() as folder:
+      source = (self.sssDir / "amide_space.txt").read_text()
+      second = source.split("\n", 1)[1].replace("amide-1", "amide-2")
+      filename = Path(folder) / "space.txt"
+      filename.write_text(source + "\n" + second)
+      space.ReadTextFile(filename)
+    build = rdSynthonSpaceSearch.ShapeBuildParams()
+    build.numConfs = 2
+    build.numThreads = 2
+    build.randomSeed = 3500
+    space.BuildSynthonShapes(build)
+    query = Chem.AddHs(Chem.MolFromSmiles("CCNC(C)=O"))
+    self.assertEqual(rdDistGeom.EmbedMolecule(query, randomSeed=3500), 0)
+    query = Chem.RemoveHs(query)
+    params = rdSynthonSpaceSearch.SynthonSpaceSearchParams()
+    params.similarityCutoff = 0.1
+    params.fragSimilarityAdjuster = 0.8
+    params.approxSimilarityAdjuster = 0.8
+    params.randomSeed = 3500
+    params.numConformers = 2
+    params.toTryChunkSize = 3
+    return space, query, params
+
+  def testShapeCandidates(self):
+    space, query, params = self.makeCandidateFixture()
+    caller = threading.get_ident()
+
+    def unexpectedConformers(smiles, count):
+      raise AssertionError("Discovery must not generate product conformers")
+
+    params.setUserConformerGenerator(unexpectedConformers)
+    previous = None
+    for threads in (1, 2):
+      with self.subTest(threads=threads):
+        params.numThreads = threads
+        batches = []
+
+        def receive(batch):
+          self.assertEqual(threading.get_ident(), caller)
+          self.assertGreater(len(batch), 0)
+          self.assertLessEqual(len(batch), params.toTryChunkSize)
+          self.assertEqual(len({name.split(";")[-1] for _, name in batch}), 1)
+          batches.append(batch)
+
+        summary = space.ShapeSearchCandidates(query, receive, params)
+        self.assertFalse(summary.GetTimedOut())
+        self.assertFalse(summary.GetCancelled())
+        self.assertEqual(len(summary.GetHitMolecules()), 0)
+        self.assertGreater(len(batches), 1)
+        candidates = [candidate for batch in batches for candidate in batch]
+        self.assertEqual({name.split(";")[-1] for _, name in candidates},
+                         {"amide-1", "amide-2"})
+        if previous is not None:
+          self.assertEqual(set(candidates), previous)
+        previous = set(candidates)
+        with tempfile.TemporaryDirectory() as folder:
+          filename = Path(folder) / "possible.smi"
+          params.possibleHitsFile = str(filename)
+          params.writePossibleHitsAndStop = True
+          space.ShapeSearch(query, params)
+          expected = {tuple(line.split()) for line in filename.read_text().splitlines()}
+          self.assertEqual(set(candidates), expected)
+        params.possibleHitsFile = ""
+        params.writePossibleHitsAndStop = False
+
+        stopped = []
+
+        def stop(batch):
+          stopped.append(batch)
+          return True
+
+        partial = space.ShapeSearchCandidates(query, stop, params)
+        self.assertEqual(len(stopped), 1)
+        self.assertLess(partial.GetMaxNumResults(), summary.GetMaxNumResults())
+        params.maxPossibleHitsToWrite = 1
+        limited = []
+        space.ShapeSearchCandidates(query, limited.extend, params)
+        self.assertEqual(len(limited), 1)
+        params.maxPossibleHitsToWrite = 0
+        space.ShapeSearchCandidates(query, limited.extend, params)
+        self.assertEqual(len(limited), 1)
+        params.maxPossibleHitsToWrite = 10000000
+
+    def fail(batch):
+      raise LookupError("candidate callback failed")
+
+    with self.assertRaisesRegex(LookupError, "candidate callback failed"):
+      space.ShapeSearchCandidates(query, fail, params)
+    recovered = []
+    space.ShapeSearchCandidates(query, recovered.extend, params)
+    self.assertEqual(set(recovered), previous)
+    with self.assertRaisesRegex(TypeError, "callable"):
+      space.ShapeSearchCandidates(query, None, params)
+    params.toTryChunkSize = 0
+    with self.assertRaisesRegex(ValueError, "toTryChunkSize"):
+      space.ShapeSearchCandidates(query, recovered.extend, params)
+    params.toTryChunkSize = 3
+    for attribute, value, default in (("randomSample", True, False),
+                                      ("hitStart", 1, 0),
+                                      ("possibleHitsFile", "unused.smi", "")):
+      with self.subTest(attribute=attribute):
+        setattr(params, attribute, value)
+        with self.assertRaisesRegex(ValueError, attribute):
+          space.ShapeSearchCandidates(query, recovered.extend, params)
+        setattr(params, attribute, default)
+    params.similarityCutoff = 2.0
+    params.fragSimilarityAdjuster = 0.0
+    params.approxSimilarityAdjuster = 0.0
+    empty = []
+    space.ShapeSearchCandidates(query, empty.extend, params)
+    self.assertEqual(empty, [])
+
+  def testValidateShapeCandidates(self):
+    space, query, params = self.makeCandidateFixture()
+    params.numThreads = 2
+    params.maxPossibleHitsToWrite = 3
+    candidates = []
+    space.ShapeSearchCandidates(query, candidates.extend, params)
+    self.assertEqual(len(candidates), 3)
+    worker = rdSynthonSpaceSearch.SynthonSpace()
+    for threads in (1, 2):
+      with self.subTest(threads=threads):
+        params.numThreads = threads
+        actual = worker.ValidateShapeCandidates(query, candidates, params)
+        with tempfile.TemporaryDirectory() as folder:
+          filename = Path(folder) / "possible.smi"
+          filename.write_text("".join(f"{smiles} {name}\n" for smiles, name in candidates))
+          params.possibleHitsFile = str(filename)
+          expected = worker.ShapeSearch(query, params, 0, len(candidates))
+        params.possibleHitsFile = ""
+        actualHits = {mol.GetProp("_Name"): mol for mol in actual.GetHitMolecules()}
+        expectedHits = {mol.GetProp("_Name"): mol for mol in expected.GetHitMolecules()}
+        self.assertGreater(len(actualHits), 0)
+        self.assertEqual(actualHits.keys(), expectedHits.keys())
+        for name, mol in actualHits.items():
+          self.assertGreater(mol.GetNumConformers(), 0)
+          self.assertEqual(Chem.MolToSmiles(mol), Chem.MolToSmiles(expectedHits[name]))
+          self.assertAlmostEqual(mol.GetDoubleProp("Similarity"),
+                                 expectedHits[name].GetDoubleProp("Similarity"))
+        self.assertEqual(actual.GetMaxNumResults(), len(candidates))
+        self.assertEqual(len(worker.ValidateShapeCandidates(query, [], params).GetHitMolecules()), 0)
+        with self.assertRaisesRegex(ValueError, "Invalid candidate SMILES"):
+          worker.ValidateShapeCandidates(query, [("not a smiles", "synthon;reaction")], params)
 
   def testShapePossibleHitsWrite(self):
     fName = self.sssDir / "amide_space_shapes.spc"

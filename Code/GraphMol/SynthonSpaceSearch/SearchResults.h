@@ -13,6 +13,8 @@
 
 #include <unordered_map>
 #include <functional>
+#include <string>
+#include <utility>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <RDGeneral/export.h>
 #include <GraphMol/ROMol.h>
@@ -25,6 +27,10 @@ namespace RDKit::SynthonSpaceSearch {
 // callee, which avoids an extra copy of the molecule.
 using SearchResultCallback =
     std::function<bool(std::vector<std::unique_ptr<ROMol>> &)>;
+
+using SearchCandidate = std::pair<std::string, std::string>;
+using SearchCandidateCallback =
+  std::function<bool(const std::vector<SearchCandidate> &)>;
 
 // A class holding a set of results from a search.  Contains the hit
 // molecules and information about how the search progressed, whether

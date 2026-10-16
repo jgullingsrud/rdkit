@@ -1225,12 +1225,9 @@ bool SynthonSpaceShapeSearcher::verifyHit(
   return foundHit;
 }
 
-void SynthonSpaceShapeSearcher::processToTrySet(
+void SynthonSpaceShapeSearcher::prepareToTrySet(
     std::vector<std::pair<const SynthonSpaceHitSet *, std::vector<size_t>>>
-        &toTry,
-    const TimePoint *endTime, std::vector<std::unique_ptr<ROMol>> &results,
-    std::atomic<std::int64_t> &numHitsFound,
-    std::uint64_t &numPossHitsWritten) {
+    &toTry) {
   // This needs to be done a bit differently because the approximate
   // similarities depend on the fragments as well as the synthons selected.
   // For the other searches, such as fingerprints, the synthons are compared
@@ -1252,6 +1249,7 @@ void SynthonSpaceShapeSearcher::processToTrySet(
     }
   }
   if (approxSims.empty()) {
+    toTry.clear();
     return;
   }
   std::sort(approxSims.begin(), approxSims.end(),
@@ -1267,7 +1265,6 @@ void SynthonSpaceShapeSearcher::processToTrySet(
   }
   toTry = std::move(newToTry);
   details::sortAndUniquifyToTry(toTry);
-  makeHitsFromToTry(toTry, endTime, results, numHitsFound, numPossHitsWritten);
 }
 
 SynthonShapeInput *SynthonSpaceShapeSearcher::getFragShape(

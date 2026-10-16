@@ -50,6 +50,8 @@ class SynthonSpaceSearcher {
 
   SearchResults search(ThreadMode threadMode);
   void search(const SearchResultCallback &cb, ThreadMode threadMode);
+    SearchResults searchCandidates(const SearchCandidateCallback &callback);
+    SearchResults checkPossibleHits(const std::vector<SearchCandidate> &candidates);
   // Take the contents of d_params.possibleHitsFile between the
   // given lines, build them, check against the query and return
   // any that match.
@@ -122,6 +124,9 @@ class SynthonSpaceSearcher {
   FragSetUniquifyMode d_fragSetUniquifyMode{FragSetUniquifyMode::BySmiles};
 
  private:
+    using HitSetCallback = std::function<bool(
+            std::vector<std::unique_ptr<SynthonSpaceHitSet>> &)>;
+
   std::unique_ptr<std::mt19937> d_randGen;
 
   const ROMol d_query;
@@ -148,12 +153,12 @@ class SynthonSpaceSearcher {
 
   std::vector<std::unique_ptr<SynthonSpaceHitSet>> assembleHitSets(
       const TimePoint *endTime, bool &timedOut, std::uint64_t &totHits,
-      ThreadMode threadMode);
+      ThreadMode threadMode, const HitSetCallback &callback = {});
 
   std::vector<std::unique_ptr<SynthonSpaceHitSet>> doTheSearch(
       std::vector<std::vector<std::shared_ptr<ROMol>>> &fragSets,
       const TimePoint *endTime, bool &timedOut, std::uint64_t &totHits,
-      ThreadMode threadMode);
+    ThreadMode threadMode, const HitSetCallback &callback = {});
 
   // Build the molecules from the synthons identified in hitsets.
   // Checks that all the results produced match the
@@ -170,6 +175,9 @@ class SynthonSpaceSearcher {
   void sortToTryByApproxSimilarity(
       std::vector<std::pair<const SynthonSpaceHitSet *, std::vector<size_t>>>
           &toTry) const;
+  virtual void prepareToTrySet(
+      std::vector<std::pair<const SynthonSpaceHitSet *, std::vector<size_t>>>
+          &toTry);
   virtual void processToTrySet(
       std::vector<std::pair<const SynthonSpaceHitSet *, std::vector<size_t>>>
           &toTry,

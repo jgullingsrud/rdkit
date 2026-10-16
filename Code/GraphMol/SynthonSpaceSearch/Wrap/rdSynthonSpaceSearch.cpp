@@ -359,6 +359,70 @@ SynthonSpaceSearch::SearchResults shapeSearch_helper(
   return results;
 }
 
+SynthonSpaceSearch::SearchResults shapeSearchCandidates_helper(
+    SynthonSpaceSearch::SynthonSpace &self, const ROMol &query,
+    const python::object &callback, const python::object &py_params) {
+  if (!PyCallable_Check(callback.ptr())) {
+    PyErr_SetString(PyExc_TypeError, "callback must be callable");
+    python::throw_error_already_set();
+  }
+  SynthonSpaceSearch::SynthonSpaceSearchParams params;
+  if (!py_params.is_none()) {
+    params = python::extract<SynthonSpaceSearch::SynthonSpaceSearchParams>(
+        py_params);
+  }
+  SynthonSpaceSearch::SearchResults results;
+  {
+    NOGIL gil;
+    results = self.shapeSearchCandidates(query, [&](const auto &candidates) {
+      PyGILStateHolder holder;
+      python::list batch;
+      for (const auto &[smiles, name] : candidates) {
+        batch.append(python::make_tuple(smiles, name));
+      }
+      python::object stop = callback(batch);
+      return !stop.is_none() && python::extract<bool>(stop)();
+    }, params);
+  }
+  if (results.getCancelled()) {
+    PyErr_SetString(PyExc_KeyboardInterrupt, "ShapeSearchCandidates cancelled");
+    python::throw_error_already_set();
+  }
+  return results;
+}
+
+SynthonSpaceSearch::SearchResults validateShapeCandidates_helper(
+    SynthonSpaceSearch::SynthonSpace &self, const ROMol &query,
+    const python::object &py_candidates, const python::object &py_params) {
+  std::vector<SynthonSpaceSearch::SearchCandidate> candidates;
+  for (python::stl_input_iterator<python::object> iterator(py_candidates), end;
+       iterator != end; ++iterator) {
+    python::object candidate = *iterator;
+    if (python::len(candidate) != 2) {
+      PyErr_SetString(PyExc_ValueError,
+                      "Candidates must be (synthon SMILES, product name) pairs");
+      python::throw_error_already_set();
+    }
+    candidates.emplace_back(python::extract<std::string>(candidate[0]),
+                            python::extract<std::string>(candidate[1]));
+  }
+  SynthonSpaceSearch::SynthonSpaceSearchParams params;
+  if (!py_params.is_none()) {
+    params = python::extract<SynthonSpaceSearch::SynthonSpaceSearchParams>(
+        py_params);
+  }
+  SynthonSpaceSearch::SearchResults results;
+  {
+    NOGIL gil;
+    results = self.validateShapeCandidates(query, candidates, params);
+  }
+  if (results.getCancelled()) {
+    PyErr_SetString(PyExc_KeyboardInterrupt, "ValidateShapeCandidates cancelled");
+    python::throw_error_already_set();
+  }
+  return results;
+}
+
 SynthonSpaceSearch::SearchResults shapeSearch_helper_3(
     SynthonSpaceSearch::SynthonSpace &self, const ROMol &query,
     const python::object &py_params, int startLine, int finishLine) {
@@ -1076,6 +1140,25 @@ BOOST_PYTHON_MODULE(rdSynthonSpaceSearch) {
           " across the synthonspace library.  Duplicate SMILES strings produced by"
           " different reactions will be returned.  Requires a query with at least"
           " 1 3D conformer.  Only the first conformer will be used in the search.")
+         .def("ShapeSearchCandidates", &helpers::shapeSearchCandidates_helper,
+           (python::arg("self"), python::arg("query"), python::arg("callback"),
+            python::arg("params") = python::object()),
+           "Stream lists of (synthon SMILES, product name) pairs without product"
+           " conformer generation. Fragment searches use params.numThreads;"
+           " callbacks run serially on the calling thread after each reaction."
+           " Return True to stop, False or None to continue. Exceptions propagate."
+           " toTryChunkSize controls screening batches; maxPossibleHitsToWrite"
+           " limits emitted records. maxHits, buildHits and writePossibleHitsAndStop"
+           " are ignored. randomSample, hitStart and possibleHitsFile are unsupported."
+           " Duplicates across batches are possible; results are not ranked."
+           " Returns discovery statistics without hit molecules; GetMaxNumResults"
+           " covers only the reactions searched when stopped early.")
+         .def("ValidateShapeCandidates", &helpers::validateShapeCandidates_helper,
+           (python::arg("self"), python::arg("query"), python::arg("candidates"),
+            python::arg("params") = python::object()),
+           "Validate (synthon SMILES, product name) pairs using conformer generation"
+           " and shape scoring, as for possible-hit-file validation. No database"
+           " is required. All records are checked; maxHits and hitStart are ignored.")
       .def(
           "ShapeSearch", &helpers::shapeSearch_helper_3,
           (python::arg("self"), python::arg("query"), python::arg("params"),
