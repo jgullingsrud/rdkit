@@ -39,6 +39,7 @@ import unittest
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 from pathlib import Path
 
@@ -161,6 +162,20 @@ class TestCase(unittest.TestCase):
       distributed.WriteDBFile(str(Path(directory) / "distributed.spc"))
       self.assertEqual((Path(directory) / "legacy.spc").read_bytes(),
                        (Path(directory) / "distributed.spc").read_bytes())
+      counted = [
+          rdSynthonSpaceSearch.BuildSynthonShapeFromPreparation(
+              params, record,
+              lambda smiles, count: cache[smiles].ToBinary(
+                  Chem.PropertyPickleOptions.CoordsAsDouble),
+              includeShapeCount=True)
+          for record in records
+      ]
+      self.assertEqual([result[:2] for result in counted], results)
+      self.assertEqual(Counter(result[2] for result in counted),
+                       Counter(distributed.GetSynthonShapeCounts()))
+      missing = rdSynthonSpaceSearch.BuildSynthonShapeFromPreparation(
+          params, records[0], lambda smiles, count: None, includeShapeCount=True)
+      self.assertEqual(missing[1:], (b"", 0))
       for invalid in ([results[0], results[0]], [("unknown", b"")],
                       [(results[0][0], b"invalid")]):
         with self.assertRaises((ValueError, RuntimeError)):
@@ -537,6 +552,35 @@ class TestCase(unittest.TestCase):
     params.numConformers = 2
     params.toTryChunkSize = 3
     return space, query, params
+
+  def testShapeCounts(self):
+    empty = rdSynthonSpaceSearch.SynthonSpace()
+    self.assertEqual(empty.GetSynthonShapeCounts(), [])
+    space, _, _ = self.makeCandidateFixture()
+    counts = space.GetSynthonShapeCounts()
+    self.assertEqual(len(counts), space.GetNumSynthons())
+    self.assertEqual(sum(count > 0 for count in counts),
+                     space.GetNumSynthonsWithShapes())
+    self.assertTrue(all(isinstance(count, int) and count >= 0 for count in counts))
+    with tempfile.TemporaryDirectory() as folder:
+      path = Path(folder) / "space.spc"
+      space.WriteDBFile(path)
+      restored = rdSynthonSpaceSearch.SynthonSpace()
+      restored.ReadDBFile(path)
+      self.assertEqual(sorted(restored.GetSynthonShapeCounts()), sorted(counts))
+      space = rdSynthonSpaceSearch.SynthonSpace()
+      space.ReadTextFile(self.sssDir / "amide_space.txt")
+      self.assertEqual(space.GetSynthonShapeCounts(), [0] * space.GetNumSynthons())
+      build = rdSynthonSpaceSearch.ShapeBuildParams()
+      build.numConfs = 3
+      build.numThreads = 1
+      build.randomSeed = 3500
+      build.rmsThreshold = -1
+      build.shapeSimThreshold = -1
+      space.BuildSynthonShapes(build)
+      multiple = space.GetSynthonShapeCounts()
+      self.assertTrue(any(count > 1 for count in multiple))
+      self.assertEqual(len(multiple), space.GetNumSynthons())
 
   def testShapeCandidates(self):
     space, query, params = self.makeCandidateFixture()

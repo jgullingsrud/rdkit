@@ -532,6 +532,8 @@ class RDKIT_SYNTHONSPACESEARCH_EXPORT SynthonSpace {
 
   void reportSynthonUsage(std::ostream &os) const;
   std::uint64_t getNumSynthonsWithShapes() const;
+  //! Retained shape counts for unique synthons, including zero; order unspecified.
+  std::vector<unsigned int> getSynthonShapeCounts() const;
 
  protected:
   unsigned int getMaxNumSynthons() const { return d_maxNumSynthons; }
@@ -655,10 +657,13 @@ RDKIT_SYNTHONSPACESEARCH_EXPORT void convertTextToDBFile(
  * Returns the synthon key and serialized shapes, or an empty shape payload when
  * no context succeeds. Uses params.userConformerGenerator and preserves context
  * and stereo fallback order. The caller must check cancelled before using output.
+ * If shapeCount is supplied, it receives the number of retained shapes (zero
+ * when cancelled or no context succeeds).
  */
 RDKIT_SYNTHONSPACESEARCH_EXPORT std::pair<std::string, std::string>
 buildSynthonShapeFromPreparation(const std::string &record, bool &cancelled,
-                                 ShapeBuildParams &params);
+                                 ShapeBuildParams &params,
+                                 unsigned int *shapeCount = nullptr);
 
 /*!
  * Format an integer with spaces every 3 digits for ease

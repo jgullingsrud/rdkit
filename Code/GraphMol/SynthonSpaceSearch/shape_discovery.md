@@ -144,6 +144,10 @@ Three additional operations separate shape computation from database mutation:
 	module-level function requiring no `SynthonSpace`. It returns the target key
 	and serialized `SynthonShapeInput` bytes. Empty bytes mean no context succeeded.
 	The supplier returns molecule-pickle bytes or `None` for unavailable conformers.
+	With `includeShapeCount=True`, the returned tuple additionally contains the
+	retained shape count, measured after pruning and before serialization. Empty
+	payloads have count zero. This lets workers report ensemble sizes without
+	deserializing the result or loading a database.
 * `space.SetSynthonShapes(entries, numConformers)` attaches `(key, shapeBytes)`
 	entries without calculating shapes. Unknown/repeated/already-shaped targets
 	are rejected within a batch, and all payloads are parsed before applying it.
@@ -152,6 +156,10 @@ Independent workers use the same shape-building implementation as local assembly
 Each record contains the whole context preference sequence for one synthon, so
 completion order does not change selection. The final writer only loads the
 source database, attaches results, writes, and validates the ordinary `.spc` file.
+`space.GetSynthonShapeCounts()` returns one retained shape count per unique
+synthon, including zero for missing shapes. Order is unspecified; an empty space
+returns an empty list. Applications can aggregate these raw counts for local-build
+statistics or read-back verification of counts reported by workers.
 
 The floe routes validated conformer results and preparation into deterministic
 self-contained ZIP bundles. Only required conformers are included, deduplicated

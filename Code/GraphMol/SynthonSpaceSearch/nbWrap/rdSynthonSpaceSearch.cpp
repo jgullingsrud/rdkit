@@ -766,6 +766,10 @@ counting of any duplicates.)DOC")
           "GetNumSynthonsWithShapes",
           &SynthonSpaceSearch::SynthonSpace::getNumSynthonsWithShapes,
           "Returns the number of synthons in the SynthonSpace that have a shape.")
+      .def("GetSynthonShapeCounts",
+           &SynthonSpaceSearch::SynthonSpace::getSynthonShapeCounts,
+           "Return retained shape counts for unique synthons, including zero"
+           " for missing shapes. Order is unspecified; an empty space returns [].")
       .def("Summarise", &summariseHelper,
            "Writes a summary of the SynthonSpace to stdout.")
       .def(

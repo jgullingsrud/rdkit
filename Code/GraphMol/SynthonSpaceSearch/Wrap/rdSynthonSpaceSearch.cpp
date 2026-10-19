@@ -23,6 +23,15 @@ namespace python = boost::python;
 namespace RDKit {
 namespace helpers {
 
+python::list shapeCounts_helper(
+    const SynthonSpaceSearch::SynthonSpace &space) {
+  python::list result;
+  for (const auto count : space.getSynthonShapeCounts()) {
+    result.append(count);
+  }
+  return result;
+}
+
 python::list hitMolecules_helper(const SynthonSpaceSearch::SearchResults &res) {
   python::list pyres;
   for (auto &r : res.getHitMolecules()) {
@@ -681,7 +690,8 @@ python::tuple preparationInfo_helper(const python::object &py_params,
 
 python::tuple buildPreparedSynthon_helper(const python::object &py_params,
                                           const python::object &record,
-                                          const python::object &supplier) {
+                                          const python::object &supplier,
+                                          bool includeShapeCount) {
   auto params =
       python::extract<SynthonSpaceSearch::ShapeBuildParams>(py_params)();
   const auto payload = shapePayloadBytes(record);
@@ -696,11 +706,12 @@ python::tuple buildPreparedSynthon_helper(const python::object &py_params,
                           : std::make_unique<RWMol>(binary);
   };
   bool cancelled = false;
+  unsigned int shapeCount = 0;
   std::pair<std::string, std::string> result;
   {
     NOGIL gil;
     result = SynthonSpaceSearch::buildSynthonShapeFromPreparation(
-        payload, cancelled, params);
+        payload, cancelled, params, &shapeCount);
   }
   if (cancelled) {
     PyErr_SetString(PyExc_KeyboardInterrupt,
@@ -709,6 +720,9 @@ python::tuple buildPreparedSynthon_helper(const python::object &py_params,
   }
   python::object shape(python::handle<>(
       PyBytes_FromStringAndSize(result.second.data(), result.second.size())));
+  if (includeShapeCount) {
+    return python::make_tuple(result.first, shape, shapeCount);
+  }
   return python::make_tuple(result.first, shape);
 }
 
@@ -1028,6 +1042,10 @@ BOOST_PYTHON_MODULE(rdSynthonSpaceSearch) {
            python::arg("self"),
            "Returns the number of synthons in the"
            " SynthonSpace that have a shape.")
+      .def("GetSynthonShapeCounts", &helpers::shapeCounts_helper,
+           python::arg("self"),
+           "Return retained shape counts for unique synthons, including zero"
+           " for missing shapes. Order is unspecified; an empty space returns [].")
       .def("Summarise", &helpers::summariseHelper, python::arg("self"),
            "Writes a summary of the SynthonSpace to stdout.")
       .def(
@@ -1220,9 +1238,11 @@ BOOST_PYTHON_MODULE(rdSynthonSpaceSearch) {
           "Return the target synthon key and unique conformer-request SMILES.");
     python::def("BuildSynthonShapeFromPreparation", &helpers::buildPreparedSynthon_helper,
           (python::arg("params"), python::arg("record"),
-           python::arg("conformerSupplier")),
+           python::arg("conformerSupplier"), python::arg("includeShapeCount") = false),
           "Build one synthon without a database. The supplier returns molecule"
-          " pickle bytes or None. Returns (synthon key, serialized shape bytes).");
+          " pickle bytes or None. Returns (synthon key, serialized shape bytes)."
+          " With includeShapeCount=True, append the retained shape count (zero"
+          " for missing shapes), measured before serialization.");
 
     docString =
       "Convert the text file into the binary DB file in our format."

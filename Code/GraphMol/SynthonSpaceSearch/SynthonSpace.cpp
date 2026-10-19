@@ -1088,9 +1088,15 @@ void SynthonSpace::buildSynthonShapesFromPreparation(
 }
 
 std::pair<std::string, std::string> buildSynthonShapeFromPreparation(
-    const std::string &record, bool &cancelled, ShapeBuildParams &params) {
+    const std::string &record, bool &cancelled, ShapeBuildParams &params,
+    unsigned int *shapeCount) {
   auto result = details::buildSynthonShapeFromRecord(record, params);
   cancelled = ControlCHandler::getGotSignal();
+  if (shapeCount) {
+    *shapeCount = !cancelled && result.second
+                      ? result.second->getShapes().getNumShapes()
+                      : 0;
+  }
   return {std::move(result.first), !cancelled && result.second
                                        ? result.second->toString()
                                        : std::string()};
@@ -1230,6 +1236,16 @@ std::vector<std::string> SynthonSpace::getSynthonShapeSmiles(
   std::vector<std::string> smiles(results.front().begin(), results.front().end());
   std::ranges::sort(smiles);
   return smiles;
+}
+
+std::vector<unsigned int> SynthonSpace::getSynthonShapeCounts() const {
+  std::vector<unsigned int> counts;
+  counts.reserve(d_synthonPool.size());
+  for (const auto &[smiles, synthon] : d_synthonPool) {
+    const auto &shape = synthon->getShapes();
+    counts.push_back(shape ? shape->getShapes().getNumShapes() : 0);
+  }
+  return counts;
 }
 
 std::uint64_t SynthonSpace::getNumSynthonsWithShapes() const {
